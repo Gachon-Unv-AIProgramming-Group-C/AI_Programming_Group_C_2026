@@ -8,10 +8,7 @@
     <div style="text-align: left;">
     <h2 style="border-bottom: 1px solid #21262d; color: #c9d1d9;"> 🛠️ Tech Stacks </h2> <br> 
     <div  align= "center"> </div>
-    </div>
-    <div style="text-align: left;"> 
-    <h2 style="border-bottom: 1px solid #21262d; color: #c9d1d9;"> 🏅 Stats </h2> <div align= "center"> <img src="https://github-readme-stats.vercel.app/api?username=serize06&repo=AI_Programming_Group_C_2026&bg_color=180,00000000,&title_color=000000&text_color=000000"
-         /> <img src="https://github-readme-stats.vercel.app/api/top-langs/?username=serize06&repo=AI_Programming_Group_C_2026&layout=compact&bg_color=180,00000000,&title_color=000000&text_color=000000"
-           /> </div> 
-    </div>
+</div>
+
+![Alt](https://repobeats.axiom.co/api/embed/9aab525420c65c37a77e23be9860edecd272db0f.svg "Repobeats analytics image")
     
