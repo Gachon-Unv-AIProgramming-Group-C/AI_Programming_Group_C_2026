@@ -6,4 +6,4 @@ Gachon Unv. AI Progarmming Project.
 ![Top Langs](https://github-readme-stats.vercel.app/api/top-langs/?username=serize06&repo=AI_Programming_Group_C_2026&layout=compact)
 
 
-![mazandi profile](http://mazandi.herokuapp.com/api?handle={handle}&theme=dark)
+![mazandi profile](https://github.com/serize06/AI_Programming_Group_C_2026/api?handle={handle}&theme=dark)
