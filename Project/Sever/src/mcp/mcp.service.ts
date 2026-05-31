@@ -515,8 +515,10 @@ export class McpService {
   }
 
   private async callHuggingFaceNli(premise: string, hypothesis: string): Promise<number> {
-    // Use microsoft/deberta-v2-xlarge-mnli model
-    const response = await fetch('https://api-inference.huggingface.co/models/microsoft/deberta-v2-xlarge-mnli', {
+    const modelId = process.env.HF_MODEL_ID || 'microsoft/deberta-v2-xlarge-mnli';
+    this.logger.log(`Calling Hugging Face Inference API with model: ${modelId}`);
+
+    const response = await fetch(`https://api-inference.huggingface.co/models/${modelId}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -537,9 +539,11 @@ export class McpService {
 
     const data = await response.json();
     if (Array.isArray(data) && Array.isArray(data[0])) {
-      const entailmentObj = data[0].find((item: any) =>
-        item.label && item.label.toLowerCase().includes('entail')
-      );
+      const entailmentObj = data[0].find((item: any) => {
+        if (!item.label) return false;
+        const labelLower = item.label.toLowerCase();
+        return labelLower.includes('entail') || labelLower === 'label_0';
+      });
       if (entailmentObj) {
         return entailmentObj.score;
       }

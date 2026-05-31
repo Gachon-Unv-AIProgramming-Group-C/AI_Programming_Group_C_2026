@@ -108,6 +108,8 @@ docker-compose up -d
 | `PORT` | No | `8000` | Server port |
 | `OPENAI_API_KEY` | Yes* | - | OpenAI API key |
 | `ANTHROPIC_API_KEY` | Yes* | - | Anthropic API key |
+| `HF_API_KEY` | No | - | Hugging Face Read Token (Required for custom NLI or inference api) |
+| `HF_MODEL_ID` | No | `microsoft/deberta-v2-xlarge-mnli` | Hugging Face custom model path (e.g., `username/klue-roberta-small-nli`) |
 | `LOG_LEVEL` | No | `info` | Log level |
 
 *Required after LLM-based layer implementation
