@@ -9,7 +9,7 @@ import numpy as np
 
 HF_TOKEN = "..." 
 USER_ID = "..."
-MODEL_NAME = "klue-roberta-small-nli" 름
+MODEL_NAME = "klue-roberta-small-nli" 
 
 if HF_TOKEN == "YOUR_HUGGINGFACE_WRITE_TOKEN":
     print("[WARNING] HF_TOKEN을 발급받아 입력해주세요! 모델을 업로드하기 위해 필수적입니다.")
