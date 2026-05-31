@@ -390,18 +390,19 @@ export class McpService {
   }
 
   private async getEntailment(premise: string, hypothesis: string, useHf: boolean, hasKeys: boolean, nliModel: string): Promise<number> {
-    const useSampling = this.canUseSampling();
-    if (!hasKeys && !useSampling) {
-      // Fall back to Jaccard similarity simulation if API keys and client sampling are both unavailable
-      return this.calculateJaccardSimilarity(premise, hypothesis);
-    }
-
+    // 1. If HF evaluation is requested and HF_API_KEY is present, prioritize calling HF Inference API
     if (useHf && process.env.HF_API_KEY) {
       try {
         return await this.callHuggingFaceNli(premise, hypothesis);
       } catch (e) {
-        this.logger.warn(`HF Inference API call failed, falling back to LLM-based evaluation: ${e.message}`);
+        this.logger.warn(`HF Inference API call failed, falling back to other evaluation methods: ${e.message}`);
       }
+    }
+
+    const useSampling = this.canUseSampling();
+    if (!hasKeys && !useSampling) {
+      // Fall back to Jaccard similarity simulation if API keys and client sampling are both unavailable
+      return this.calculateJaccardSimilarity(premise, hypothesis);
     }
 
     // LLM-based entailment evaluation
