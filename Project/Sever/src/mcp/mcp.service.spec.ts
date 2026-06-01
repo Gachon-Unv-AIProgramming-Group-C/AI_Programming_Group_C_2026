@@ -17,52 +17,58 @@ describe('McpService', () => {
     expect(service).toBeDefined();
   });
 
-  describe('checkHallucination (Mock Mode)', () => {
-    it('should pass Stage 1 when self-consistency is very high (Self MPD < t1)', async () => {
+  describe('checkHallucination (3-Layer Cascade Mock Mode)', () => {
+    it('should pass Layer 1 when logprobs are high confidence (L1 score < t1)', async () => {
       const input: HallucinationCheckInput = {
         question: 'What is the capital of South Korea?',
         response: 'Seoul',
-        t1: 0.5,
-        tStar: 0.9,
-        m: 3,
+        logprobs: [
+          { token: 'Seoul', logprob: -0.01 },
+          { token: 'is', logprob: -0.01 },
+          { token: 'the', logprob: -0.01 },
+          { token: 'capital', logprob: -0.01 }
+        ],
+        t1: 0.3,
+        w1: 1.0,
       };
-      
+
       const result = await (service as any).checkHallucination(input);
       expect(result.is_hallucination).toBe(false);
-      expect(result.details.stage).toBe(1);
-      expect(result.details.selfMpd).toBeLessThan(input.t1);
+      expect(result.details.layersRun).toContain(1);
+      expect(result.details.layersRun).not.toContain(2);
+      expect(result.details.score1).toBeLessThan(input.t1!);
     });
 
-    it('should fail Stage 1 when self-consistency is very low (Self MPD > tStar)', async () => {
+    it('should pass Layer 2 when SINdex indicates high consistency (score2 < s2_threshold)', async () => {
       const input: HallucinationCheckInput = {
-        question: 'What is the size of the universe?',
-        response: 'The size of the universe is unknown.',
-        t1: 0.01,
-        tStar: 0.1,
+        question: 'What is the capital of South Korea?',
+        response: 'Seoul',
+        t1: 0.3,
+        s2_threshold: 0.9, // high threshold to guarantee pass
         m: 3,
       };
 
       const result = await (service as any).checkHallucination(input);
-      expect(result.is_hallucination).toBe(true);
-      expect(result.details.stage).toBe(1);
-      expect(result.details.selfMpd).toBeGreaterThan(input.tStar);
+      expect(result.is_hallucination).toBe(false);
+      expect(result.details.layersRun).toContain(1);
+      expect(result.details.layersRun).toContain(2);
+      expect(result.details.layersRun).not.toContain(3);
     });
 
-    it('should proceed to Stage 2 when Self MPD is in the uncertainty interval [t1, tStar]', async () => {
+    it('should proceed to Layer 3 and classify when SINdex is inconsistent', async () => {
       const input: HallucinationCheckInput = {
-        question: 'Purposefully asking an ambiguous consistency question.',
-        response: 'This is a test response.',
-        t1: 0.1,
-        tStar: 0.6,
+        question: 'An inconsistent question.',
+        response: 'response',
+        s2_threshold: 0.01, // low threshold to force Layer 3
         t2: 0.5,
-        m: 4,
+        m: 3,
       };
 
       const result = await (service as any).checkHallucination(input);
-      expect(result.details.stage).toBe(2);
-      expect(result.details.selfMpd).toBeGreaterThanOrEqual(input.t1);
-      expect(result.details.selfMpd).toBeLessThanOrEqual(input.tStar);
-      expect(result.details.crossMpd).toBeDefined();
+      expect(result.details.layersRun).toContain(1);
+      expect(result.details.layersRun).toContain(2);
+      expect(result.details.layersRun).toContain(3);
+      expect(result.is_hallucination).toBeDefined();
     });
 
     it('should use client-side sampling if no API keys are present but sampling capability is enabled', async () => {
@@ -77,21 +83,8 @@ describe('McpService', () => {
         // Asynchronously reply to the request
         setTimeout(() => {
           if (msg.method === 'sampling/createMessage') {
-            // For sub-questions generation: return standard JSON array
-            if (msg.params.systemPrompt && msg.params.systemPrompt.includes('verification question generator')) {
-              service.handleRequest({
-                jsonrpc: '2.0',
-                id: msg.id,
-                result: {
-                  role: 'assistant',
-                  content: {
-                    type: 'text',
-                    text: JSON.stringify(['Verification question A', 'Verification question B'])
-                  }
-                }
-              });
-            } else if (msg.params.systemPrompt && msg.params.systemPrompt.includes('Natural Language Inference')) {
-              // For NLI probability: return high similarity
+            // For NLI probability: return high similarity
+            if (msg.params.systemPrompt && msg.params.systemPrompt.includes('Natural Language Inference')) {
               service.handleRequest({
                 jsonrpc: '2.0',
                 id: msg.id,
@@ -104,7 +97,7 @@ describe('McpService', () => {
                 }
               });
             } else {
-              // For other LLM questions: return factual answer
+              // For paraphrasing or other LLM calls
               service.handleRequest({
                 jsonrpc: '2.0',
                 id: msg.id,
@@ -112,7 +105,7 @@ describe('McpService', () => {
                   role: 'assistant',
                   content: {
                     type: 'text',
-                    text: 'This is the answer to the verification question.'
+                    text: JSON.stringify(['Paraphrased question A', 'Paraphrased question B'])
                   }
                 }
               });
@@ -124,6 +117,7 @@ describe('McpService', () => {
       const input: HallucinationCheckInput = {
         question: 'This is a question to test the sampling capability.',
         response: 'Test answer',
+        s2_threshold: 0.01, // force Layer 3
         t1: 0.3,
         tStar: 0.7,
         m: 3,

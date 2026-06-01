@@ -8,6 +8,10 @@ import { AppService } from './app.service';
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
+      envFilePath: [
+        '/home/serize/hallucination-server/.env',
+        '.env',
+      ],
     }),
     McpModule,
   ],

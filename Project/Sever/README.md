@@ -1,98 +1,224 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# Hallucination Detector
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+A hallucination detection server for LLM responses, exposed as an MCP (Model Context Protocol) tool. Built on the **"Verify when Uncertain"** paper (arXiv:2502.15845), extended into a 3-layer cascade architecture.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+## How it works
 
-## Description
+Detection runs in up to three layers, stopping early when confidence is high enough:
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+```
+Layer 1 — LSC (Lowest Span Confidence)
+  If logprobs are provided, low-confidence tokens trigger further checks.
 
-## Project setup
+Layer 2 — SINdex (Semantic Inconsistency Index)
+  Samples multiple responses to the same question, clusters them,
+  and measures how scattered they are. High scatter = likely hallucination.
 
-```bash
-$ npm install
+Layer 3 — SAC³ (Cross-model Consistency)
+  Paraphrases the original question using a fine-tuned Qwen model,
+  asks an independent verifier, and checks if the answers agree.
+  Our fine-tuned KLUE-RoBERTa NLI model scores the entailment.
 ```
 
-## Compile and run the project
+Verdict: `HALLUCINATION` | `NO_HALLUCINATION` | `UNCERTAIN` (manual review recommended)
 
-```bash
-# development
-$ npm run start
+## Models
 
-# watch mode
-$ npm run start:dev
+Two custom models are used in this project:
 
-# production mode
-$ npm run start:prod
+| Model | Role | HuggingFace |
+|-------|------|-------------|
+| `serize/klue-roberta-base-nli-stage2` | NLI scoring (Layer 3 entailment) | [link](https://huggingface.co/serize/klue-roberta-base-nli-stage2) |
+| `serize/local-qwen-paraphraser` | Question paraphrasing (Layer 3) | [link](https://huggingface.co/serize/local-qwen-paraphraser) |
+
+The NLI model was fine-tuned on KLUE NLI data. The paraphraser is Qwen2.5-0.5B-Instruct fine-tuned on the ParaKQC Korean paraphrase dataset.
+
+## Project structure
+
+```
+.
+├── src/
+│   └── mcp/
+│       ├── mcp.service.ts      # 3-layer cascade algorithm
+│       ├── mcp.controller.ts   # POST /mcp HTTP endpoint
+│       ├── mcp.module.ts
+│       └── mcp.types.ts        # Input/output type definitions
+├── nli_server.py               # Python inference server (NLI + paraphraser)
+├── train_paraphraser.py        # Local training script for the paraphraser
+├── train_paraphraser_colab.ipynb  # Colab notebook version
+├── train_stage2_nli.py         # NLI fine-tuning script
+├── Dockerfile                  # NestJS server
+├── Dockerfile.python           # Python NLI server
+├── docker-compose.yml          # Runs both services together
+└── requirements-nli.txt        # Python dependencies
 ```
 
-## Run tests
+## Quick start
+
+### Option 1: Docker Compose (recommended)
+
+Requires Docker with [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) for GPU support.
 
 ```bash
-# unit tests
-$ npm run test
+# 1. Clone and enter the project
+git clone https://github.com/your-org/hallucination-detector
+cd hallucination-detector
 
-# e2e tests
-$ npm run test:e2e
+# 2. Copy env file and fill in your keys
+cp .env.example .env
 
-# test coverage
-$ npm run test:cov
+# 3. Start
+docker-compose up --build
 ```
 
-## Deployment
+The Python NLI server downloads the paraphraser model from HuggingFace on first start and caches it in a Docker volume. Subsequent starts reuse the cached model.
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
+Services will be available at:
+- NestJS MCP server: `http://localhost:8000/mcp`
+- Python NLI server: `http://localhost:8001/health`
 
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
+### Option 2: Local (without Docker)
+
+**Requirements:** Node.js 20+, Python 3.11+, PyTorch (CPU or CUDA)
 
 ```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
+# Terminal 1: Start the Python NLI server
+pip install -r requirements-nli.txt torch --index-url https://download.pytorch.org/whl/cpu
+python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('serize/local-qwen-paraphraser', local_dir='local-qwen-paraphraser')
+"
+python nli_server.py
+
+# Terminal 2: Start the NestJS server
+npm install
+cp .env.example .env
+npm run start:dev
 ```
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+### Option 3: stdio (Claude Code MCP)
 
-## Resources
+Register the server as a stdio MCP tool in Claude Code:
 
-Check out a few resources that may come in handy when working with NestJS:
+```bash
+npm run build
 
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
+claude mcp add --transport stdio hallucination-detector \
+  node /absolute/path/to/dist/main.js -- --stdio
+```
 
-## Support
+Or add it manually to `~/.claude.json` under `mcpServers`:
 
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
+```json
+{
+  "hallucination-detector": {
+    "type": "stdio",
+    "command": "node",
+    "args": ["/absolute/path/to/dist/main.js", "--stdio"],
+    "env": {
+      "HF_API_KEY": "hf_...",
+      "NLI_SERVER_URL": "http://127.0.0.1:8001"
+    }
+  }
+}
+```
 
-## Stay in touch
+## Environment variables
 
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `8000` | HTTP server port |
+| `OPENAI_API_KEY` | - | OpenAI key (used as LLM verifier) |
+| `ANTHROPIC_API_KEY` | - | Anthropic key (used as LLM verifier) |
+| `HF_API_KEY` | - | Hugging Face token |
+| `HF_MODEL_ID` | `jhgan/ko-sroberta-nli` | Stage 1 NLI model |
+| `HF_STAGE2_MODEL_ID` | `serize/klue-roberta-base-nli-stage2` | Stage 2 NLI model |
+| `NLI_SERVER_URL` | `http://127.0.0.1:8001` | Python NLI server URL |
+| `NLI_SERVER_PORT` | `8001` | Python NLI server port (local only) |
+| `LOG_LEVEL` | `info` | Log level |
 
-## License
+At least one of `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` is needed for Layer 2/3 to run LLM verification. If neither is set but the server is running as a Claude Code stdio MCP, it will use client sampling instead.
 
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+## Tool API
+
+### `check_hallucination`
+
+**Input**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `question` | string | yes | The question asked to the LLM |
+| `response` | string | yes | The LLM response to check |
+| `context` | string | no | Optional source context |
+| `m` | integer | no | Number of samples per layer (default: 5) |
+| `t1` | float | no | Layer 1 lower threshold (default: 0.3) |
+| `tStar` | float | no | Layer 1 upper threshold (default: 0.7) |
+| `s2_threshold` | float | no | Layer 2 inconsistency threshold (default: 0.4) |
+| `t2` | float | no | Final decision threshold (default: 0.5) |
+| `useHuggingFaceNli` | boolean | no | Force HF NLI API (default: false) |
+
+**Output**
+
+```json
+{
+  "verdict": "HALLUCINATION",
+  "is_hallucination": true,
+  "confidence": 0.82,
+  "reason": "[Layer 3 Detected] Combined risk score 0.82 ...",
+  "details": {
+    "layersRun": [1, 2, 3],
+    "mode": "llm",
+    "score1": 0.45,
+    "score2": 0.71,
+    "score3": 0.81,
+    "final_score": 0.72
+  }
+}
+```
+
+When `verdict` is `UNCERTAIN`, the server asks the connected LLM to prompt the user for manual review.
+
+**Example**
+
+```bash
+curl -X POST http://localhost:8000/mcp \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "check_hallucination",
+      "arguments": {
+        "question": "When did the Hualien earthquake occur?",
+        "response": "The magnitude 7.2 earthquake in Hualien, Taiwan occurred on April 2, 2024."
+      }
+    }
+  }'
+```
+
+## Training
+
+### NLI model
+
+```bash
+python train_stage2_nli.py
+```
+
+Fine-tunes `klue/roberta-base` on KLUE NLI data for 3-class entailment classification.
+
+### Paraphraser
+
+**Local:**
+```bash
+python train_paraphraser.py
+```
+
+**Google Colab (recommended — free T4 GPU):**
+
+Open `train_paraphraser_colab.ipynb` in Colab. Training takes about 10 minutes on a T4. The trained model is automatically pushed to your HuggingFace Hub after training.
+
+## Reference
+
+> **Verify when Uncertain: Beyond Self-Consistency in Black Box Hallucination Detection**  
+> arXiv:2502.15845, February 2025

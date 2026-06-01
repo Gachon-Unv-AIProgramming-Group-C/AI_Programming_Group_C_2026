@@ -18,7 +18,6 @@ export class McpService {
     { resolve: (value: any) => void; reject: (reason?: any) => void }
   >();
 
-  // List of registered tools
   private readonly tools: McpTool[] = [
     {
       name: 'check_hallucination',
@@ -117,6 +116,7 @@ export class McpService {
 
   private handleInitialize(req: JsonRpcRequest): JsonRpcResponse {
     this.clientCapabilities = req.params?.capabilities;
+    this.logger.log(`[INIT] sampling=${this.canUseSampling()} hfKey=${!!(process.env.HF_API_KEY)} apiKeys=${this.hasApiKeys()}`);
     return {
       jsonrpc: '2.0',
       id: req.id,
@@ -124,6 +124,7 @@ export class McpService {
         protocolVersion: '2024-11-05',
         capabilities: {
           tools: {},
+          sampling: {},
         },
         serverInfo: {
           name: 'hallucination-detector',
@@ -158,17 +159,22 @@ export class McpService {
       try {
         const result = await this.checkHallucination(input);
 
+        const content: { type: string; text: string }[] = [
+          { type: 'text', text: JSON.stringify(result, null, 2) },
+        ];
+
+        if (result.verdict === 'UNCERTAIN') {
+          const score = result.details?.final_score?.toFixed(3) ?? 'N/A';
+          content.push({
+            type: 'text',
+            text: `\n[UNCERTAIN] The hallucination detector could not make a confident judgment (score: ${score}). Please ask the user whether they would like to perform a manual review of this response.`,
+          });
+        }
+
         return {
           jsonrpc: '2.0',
           id: req.id,
-          result: {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify(result, null, 2),
-              },
-            ],
-          },
+          result: { content },
         };
       } catch (error) {
         return {
@@ -189,191 +195,404 @@ export class McpService {
     };
   }
 
-  // ── Verify when Uncertain (Beyond Self-Consistency) 2-Stage Cascade Algorithm ──
-  // Option A: Cross-Examination Agent Method Applied
   private async checkHallucination(input: HallucinationCheckInput): Promise<HallucinationCheckResult> {
     const targetModel = input.targetModel || 'gpt-4o-mini';
     const verifierModel = input.verifierModel || 'gpt-4o-mini';
-    const nliModel = input.nliModel || targetModel;
+    const nliModel = input.nliModel || 'jhgan/ko-sroberta-nli';
     const m = Math.min(input.m || 5, 10);
     const t1 = input.t1 !== undefined ? input.t1 : 0.3;
     const tStar = input.tStar !== undefined ? input.tStar : 0.7;
+    const s2_threshold = input.s2_threshold !== undefined ? input.s2_threshold : 0.4;
     const t2 = input.t2 !== undefined ? input.t2 : 0.5;
+    const w1 = input.w1 !== undefined ? input.w1 : 0.2;
+    const w2 = input.w2 !== undefined ? input.w2 : 0.3;
+    const w3 = input.w3 !== undefined ? input.w3 : 0.5;
     const useHf = !!input.useHuggingFaceNli;
 
-    this.logger.log(`Starting hallucination check - Question: "${input.question}" (Option A: Cross-Examination Agent, NLI Model: ${nliModel})`);
-
-    // Check if API keys are present or client-side sampling is supported
+    // Determine available backends
     const hasKeys = this.hasApiKeys();
     const useSampling = this.canUseSampling();
-    const canRunRealLlm = hasKeys || useSampling;
+    const hasHfKey = !!(process.env.HF_API_KEY);
+    const hasLocalLlm = this.hasLocalLlm();
+    const canRunRealLlm = hasKeys || useSampling || hasHfKey || hasLocalLlm;
+    const mode = canRunRealLlm ? 'llm' : (useHf && hasHfKey ? 'hf-nli-proxy' : 'mock');
 
-    // Stage 1: Generate sub-verification questions (generate m-1 to test m response states)
-    const subQuestions = await this.generateSubQuestions(input.question, input.response, m, targetModel, canRunRealLlm);
-    this.logger.log(`Generated verification sub-questions: ${JSON.stringify(subQuestions)}`);
+    const layersRun: number[] = [];
+    let score1 = 0;
+    let score2 = 0;
+    let score3 = 0;
+    let forceLayers2And3 = false;
 
-    // ── Stage 1: Ask target model to answer sub-verification questions and compare with the original response ──
-    const targetAnswers: string[] = [];
-    if (canRunRealLlm) {
-      for (const sq of subQuestions) {
-        const prompt = `Question: "${sq}"\nProvide a direct, concise, and factual answer in one sentence.`;
-        const ans = await this.callLLM(targetModel, prompt, 0.1);
-        targetAnswers.push(ans);
-      }
-    } else {
-      this.logger.warn('API keys are not set. Running in Mock mode.');
-      const isCapital = input.question.includes('수도') || input.question.toLowerCase().includes('capital');
-      const isUniverse = input.question.includes('우주') || input.question.toLowerCase().includes('universe');
-      
-      for (let i = 0; i < subQuestions.length; i++) {
-        if (isCapital) {
-          // High consistency (mocking identical response)
-          targetAnswers.push(input.response);
-        } else if (isUniverse) {
-          // Low consistency (mocking contradiction)
-          targetAnswers.push(`Contradictory universe response version ${i + 1}`);
-        } else {
-          // Moderate consistency
-          if (i % 2 === 0) {
-            targetAnswers.push(input.response);
-          } else {
-            targetAnswers.push('Another mock response with a different opinion.');
+    const details: any = {
+      layersRun,
+      mode,
+      thresholdsUsed: { t1, tStar, s2_threshold, t2, m },
+      weightsUsed: { w1, w2, w3 },
+    };
+
+    this.logger.debug(`check_hallucination mode=${mode} q="${input.question.slice(0, 60)}"`);
+
+    // Layer 1: LSC
+    layersRun.push(1);
+    if (input.logprobs && input.logprobs.length > 0) {
+      let minSpanConfidence = 1.0;
+      const tokens = input.logprobs;
+      const windowSizes = [2, 3, 5];
+      let hasValidWindow = false;
+
+      for (const w of windowSizes) {
+        if (tokens.length >= w) {
+          for (let i = 0; i <= tokens.length - w; i++) {
+            let sumLogProb = 0;
+            for (let j = 0; j < w; j++) {
+              sumLogProb += tokens[i + j].logprob;
+            }
+            const spanProb = Math.exp(sumLogProb / w); // geometric mean probability
+            if (spanProb < minSpanConfidence) {
+              minSpanConfidence = spanProb;
+            }
+            hasValidWindow = true;
           }
         }
       }
-    }
 
-    // Stage 1 Entailment Evaluation: Does the original response entail each sub-question answer? E(response, targetAnswer_j)
-    const selfScores: number[] = [];
-    for (let i = 0; i < subQuestions.length; i++) {
-      const score = await this.getEntailment(input.response, targetAnswers[i], useHf, hasKeys, nliModel);
-      selfScores.push(score);
-    }
+      const lsc = hasValidWindow ? minSpanConfidence : 0.5;
+      score1 = 1 - lsc;
+      details.score1 = score1;
 
-    // Self MPD = 1 - Mean(SelfScores)
-    const sumSelf = selfScores.reduce((acc, val) => acc + val, 0);
-    const selfMpd = selfScores.length > 0 ? 1 - (sumSelf / selfScores.length) : 0;
-    
-    // Process samples for logging and display
-    const targetSamples = subQuestions.map((q, idx) => `Q: ${q} -> A: ${targetAnswers[idx]}`);
-
-    this.logger.log(`Stage 1 (Self-Consistency) finished - Self MPD: ${selfMpd.toFixed(4)} (Threshold range: t1=${t1}, t*=${tStar})`);
-
-    // Stage 1 Decision Check
-    if (selfMpd < t1) {
-      return {
-        is_hallucination: false,
-        confidence: 1 - selfMpd,
-        reason: `[Stage 1 Pass] Self-consistency divergence (Self MPD: ${selfMpd.toFixed(4)}) is below the lower threshold (t1: ${t1}). The original response entails the sub-question answers correctly.`,
-        details: {
-          stage: 1,
-          selfMpd,
-          targetSamples,
-          thresholdsUsed: { t1, tStar, t2, m },
-        },
-      };
-    }
-
-    if (selfMpd > tStar) {
-      return {
-        is_hallucination: true,
-        confidence: selfMpd,
-        reason: `[Stage 1 Detected] Self-consistency divergence (Self MPD: ${selfMpd.toFixed(4)}) exceeds the upper threshold (t*: ${tStar}). There is a large inconsistency between the original response and sub-question answers.`,
-        details: {
-          stage: 1,
-          selfMpd,
-          targetSamples,
-          thresholdsUsed: { t1, tStar, t2, m },
-        },
-      };
-    }
-
-    // ── Stage 2: Ask verification questions to external Verifier model since it is in the uncertainty interval ──
-    this.logger.log(`Entered uncertainty interval: ${t1} <= Self MPD(${selfMpd.toFixed(4)}) <= ${tStar}. Starting Stage 2 cross-model verification.`);
-
-    const verifierAnswers: string[] = [];
-    if (canRunRealLlm) {
-      for (const sq of subQuestions) {
-        const prompt = `Question: "${sq}"\nProvide a direct, concise, and factual answer in one sentence.`;
-        const ans = await this.callLLM(verifierModel, prompt, 0.1);
-        verifierAnswers.push(ans);
+      if (score1 < t1) {
+        const final_score = w1 * score1;
+        return {
+          verdict: 'NO_HALLUCINATION' as const,
+          is_hallucination: false,
+          confidence: 1 - final_score,
+          reason: `[Layer 1 Pass] Lowest Span Confidence (LSC) risk score ${score1.toFixed(4)} is below t1 (${t1}). Trusted response.`,
+          details: { ...details, final_score, stage: 1, selfMpd: score1, combinedMpd: score1 }
+        };
+      }
+      if (score1 >= tStar) {
+        forceLayers2And3 = true;
       }
     } else {
-      // Generate mock data (matching parts of the target answers to mimic 50% cross-consistency)
-      for (let i = 0; i < subQuestions.length; i++) {
-        if (i % 2 === 0) {
-          verifierAnswers.push(targetAnswers[i]);
-        } else {
-          verifierAnswers.push(`Different verifier mock response ${i + 1}`);
+      score1 = 0.45;
+      details.score1 = score1;
+    }
+
+    // Layer 2: SINdex
+    layersRun.push(2);
+    const targetSamples: string[] = [input.response];
+
+    if (canRunRealLlm) {
+      for (let i = 0; i < m; i++) {
+        try {
+          const sample = await this.callLLM(targetModel, input.question, 0.7);
+          targetSamples.push(sample);
+        } catch (e) {
+          this.logger.error(`Error generating sample ${i + 1}: ${e.message}`);
+        }
+      }
+    } else if (mode === 'hf-nli-proxy') {
+      targetSamples.push(input.response + " (alternative phrasing)");
+      targetSamples.push(input.response + " (detailed statement)");
+    } else {
+      // Mock mode
+      for (let i = 0; i < m; i++) {
+        targetSamples.push(i % 2 === 0 ? input.response : `Different mock response variation ${i + 1}`);
+      }
+    }
+
+    const K = targetSamples.length;
+    const similarityMatrix: number[][] = [];
+    for (let i = 0; i < K; i++) {
+      try {
+        const sims = await this.getBulkSimilarity(targetSamples[i], targetSamples, useHf, nliModel);
+        similarityMatrix.push(sims);
+      } catch (e) {
+        this.logger.error(`Error calculating bulk similarity for sample ${i}: ${e.message}`);
+        // Fallback similarity array
+        similarityMatrix.push(targetSamples.map(t => this.calculateJaccardSimilarity(targetSamples[i], t)));
+      }
+    }
+
+    let clusters: number[][] = Array.from({ length: K }).map((_, i) => [i]);
+    while (clusters.length > 1) {
+      let maxSim = -1;
+      let mergeI = -1;
+      let mergeJ = -1;
+
+      for (let i = 0; i < clusters.length; i++) {
+        for (let j = i + 1; j < clusters.length; j++) {
+          let sumSim = 0;
+          const cA = clusters[i];
+          const cB = clusters[j];
+          for (const idxA of cA) {
+            for (const idxB of cB) {
+              sumSim += similarityMatrix[idxA][idxB];
+            }
+          }
+          const avgSim = sumSim / (cA.length * cB.length);
+          if (avgSim > maxSim) {
+            maxSim = avgSim;
+            mergeI = i;
+            mergeJ = j;
+          }
+        }
+      }
+
+      if (maxSim >= 0.95) {
+        clusters[mergeI] = [...clusters[mergeI], ...clusters[mergeJ]];
+        clusters.splice(mergeJ, 1);
+      } else {
+        break;
+      }
+    }
+
+    let sindexSum = 0;
+    for (const c of clusters) {
+      const pC = c.length / K;
+      let sumSimToOriginal = 0;
+      for (const idx of c) {
+        sumSimToOriginal += similarityMatrix[idx][0];
+      }
+      const simC = sumSimToOriginal / c.length;
+      if (pC > 0) {
+        sindexSum += pC * simC * Math.log(pC);
+      }
+    }
+    const sindex = -sindexSum;
+    score2 = K > 1 ? sindex / Math.log(K) : 0;
+    score2 = Math.max(0, Math.min(1, score2));
+
+    const clusterDetails = clusters.map((c, idx) => {
+      const members = c.map(i => targetSamples[i]);
+      const sumSimToOriginal = c.reduce((sum, i) => sum + similarityMatrix[i][0], 0);
+      const simToOriginal = sumSimToOriginal / c.length;
+      return {
+        label: `Cluster ${idx + 1}`,
+        size: c.length,
+        members,
+        similarityToOriginal: simToOriginal
+      };
+    });
+
+    details.clusters = clusterDetails;
+    details.score2 = score2;
+    details.targetSamples = targetSamples;
+
+    if (score2 < s2_threshold && !forceLayers2And3) {
+      const final_score = w1 * score1 + w2 * score2;
+      return {
+        verdict: 'NO_HALLUCINATION' as const,
+        is_hallucination: false,
+        confidence: 1 - final_score,
+        reason: `[Layer 2 Pass] SINdex score ${score2.toFixed(4)} is below threshold (${s2_threshold}). Consistent response.`,
+        details: { ...details, final_score, stage: 2, selfMpd: score2, combinedMpd: (score1 + score2) / 2 }
+      };
+    }
+
+    // Layer 3: SAC³
+    layersRun.push(3);
+    let paraphrasedQuestions: string[] = [];
+
+    try {
+      paraphrasedQuestions = await this.callLocalParaphraser(input.question);
+    } catch (e) {
+      this.logger.warn(`Local paraphraser unavailable: ${e.message}`);
+    }
+
+    if (paraphrasedQuestions.length === 0 && canRunRealLlm) {
+      const systemPrompt = `You are a question paraphrasing expert. Generate exactly 3 semantic variations of the given question. They must ask for the exact same factual information but using different phrasing or structure in the same language. Output ONLY a valid JSON string array of the 3 questions.`;
+      try {
+        const result = await this.callLLM(targetModel, `Question: "${input.question}"`, 0.3, systemPrompt);
+        const cleanJson = result.replace(/```json|```/g, '').trim();
+        const parsed = JSON.parse(cleanJson);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          paraphrasedQuestions = parsed.map((q: any) => String(q).trim()).slice(0, 3);
+        }
+      } catch (e) {
+        this.logger.error(`Error generating paraphrased questions: ${e.message}`);
+      }
+    }
+
+    if (paraphrasedQuestions.length === 0) {
+      paraphrasedQuestions = [
+        `Rephrase: ${input.question}`,
+        `Restate: ${input.question}`,
+      ];
+    }
+    details.paraphrasedQuestions = paraphrasedQuestions;
+
+    const nSac = 2;
+    const sacTargetAnswers: string[] = [];
+    const sacVerifierAnswers: string[] = [];
+
+    if (canRunRealLlm) {
+      for (const pq of paraphrasedQuestions) {
+        for (let i = 0; i < nSac; i++) {
+          try {
+            const tAns = await this.callLLM(targetModel, pq, 0.7);
+            sacTargetAnswers.push(tAns);
+          } catch (e) {
+            this.logger.error(`Error sampling target answer for "${pq}": ${e.message}`);
+          }
+          try {
+            const vAns = await this.callLLM(verifierModel, pq, 0.7);
+            sacVerifierAnswers.push(vAns);
+          } catch (e) {
+            this.logger.error(`Error sampling verifier answer for "${pq}": ${e.message}`);
+          }
+        }
+      }
+    } else {
+      for (const pq of paraphrasedQuestions) {
+        for (let i = 0; i < nSac; i++) {
+          sacTargetAnswers.push(i === 0 ? input.response : `Mock target SAC3 response for: ${pq}`);
+          sacVerifierAnswers.push(i === 0 ? input.response : `Mock verifier SAC3 response for: ${pq}`);
         }
       }
     }
 
-    // Stage 2 Cross Entailment Evaluation: Does the verifier response entail the target response? E(verifierAnswer_j, targetAnswer_j)
-    const crossScores: number[] = [];
-    for (let i = 0; i < subQuestions.length; i++) {
-      const score = await this.getEntailment(verifierAnswers[i], targetAnswers[i], useHf, hasKeys, nliModel);
-      crossScores.push(score);
+    const allSacAnswers = [...sacTargetAnswers, ...sacVerifierAnswers];
+    const entailmentScores: number[] = [];
+
+    for (const ans of allSacAnswers) {
+      const score = await this.getEntailment(input.response, ans, useHf, hasKeys, nliModel);
+      entailmentScores.push(score);
     }
 
-    // Cross MPD = 1 - Mean(CrossScores)
-    const sumCross = crossScores.reduce((acc, val) => acc + val, 0);
-    const crossMpd = crossScores.length > 0 ? 1 - (sumCross / crossScores.length) : 0;
-    const isHallucination = crossMpd > t2;
+    const sumEntailment = entailmentScores.reduce((sum, s) => sum + s, 0);
+    score3 = entailmentScores.length > 0 ? 1 - (sumEntailment / entailmentScores.length) : 0.5;
+    score3 = Math.max(0, Math.min(1, score3));
 
-    this.logger.log(`Stage 2 (Cross-Model Consistency) finished - Cross MPD: ${crossMpd.toFixed(4)} (Threshold: t2=${t2})`);
+    details.score3 = score3;
+    details.verifierSamples = allSacAnswers;
+
+    const final_score = w1 * score1 + w2 * score2 + w3 * score3;
+    const uncertaintyMargin = input.uncertainty_margin ?? 0.05;
+
+    let verdict: 'HALLUCINATION' | 'NO_HALLUCINATION' | 'UNCERTAIN';
+    if (final_score > t2 + uncertaintyMargin) {
+      verdict = 'HALLUCINATION';
+    } else if (final_score < t2 - uncertaintyMargin) {
+      verdict = 'NO_HALLUCINATION';
+    } else {
+      verdict = 'UNCERTAIN';
+    }
+    const isHallucination = verdict === 'HALLUCINATION';
+
+    this.logger.log(`Final 3-Layer Cascade decision: final_score=${final_score.toFixed(4)}, t2=${t2}±${uncertaintyMargin} → ${verdict}`);
 
     return {
+      verdict,
       is_hallucination: isHallucination,
-      confidence: isHallucination ? crossMpd : 1 - crossMpd,
-      reason: isHallucination
-        ? `[Stage 2 Detected] Cross-model inconsistency (Cross MPD: ${crossMpd.toFixed(4)}) exceeds the threshold (t2: ${t2}). Classified as hallucination due to disagreement with the verifier.`
-        : `[Stage 2 Pass] Cross-model inconsistency (Cross MPD: ${crossMpd.toFixed(4)}) is below or equal to the threshold (t2: ${t2}). Classified as factual due to agreement with the verifier.`,
+      confidence: verdict === 'UNCERTAIN' ? 0.5 : (isHallucination ? final_score : 1 - final_score),
+      reason: verdict === 'HALLUCINATION'
+        ? `[Layer 3 Detected] Combined risk score ${final_score.toFixed(4)} (L1: ${score1.toFixed(4)}, L2: ${score2.toFixed(4)}, L3: ${score3.toFixed(4)}) exceeds threshold t2 (${t2}). Hallucination detected.`
+        : verdict === 'UNCERTAIN'
+        ? `[Layer 3 Uncertain] Combined risk score ${final_score.toFixed(4)} is within uncertainty zone t2±${uncertaintyMargin} (${(t2 - uncertaintyMargin).toFixed(2)}~${(t2 + uncertaintyMargin).toFixed(2)}). Manual review recommended.`
+        : `[Layer 3 Pass] Combined risk score ${final_score.toFixed(4)} (L1: ${score1.toFixed(4)}, L2: ${score2.toFixed(4)}, L3: ${score3.toFixed(4)}) is within threshold t2 (${t2}). Factual.`,
       details: {
-        stage: 2,
-        selfMpd,
-        crossMpd,
-        targetSamples,
-        verifierSamples: verifierAnswers,
-        thresholdsUsed: { t1, tStar, t2, m },
-      },
+        ...details,
+        final_score,
+        stage: 3,
+        selfMpd: score2,
+        crossMpd: score3,
+        combinedMpd: (score2 + score3) / 2
+      }
     };
   }
 
   // Verification sub-question generator agent
+  // When LLM is available: use LLM to generate sub-questions.
+  // When HF-proxy mode (no LLM, has HF): use rule-based decomposition from the question/response.
+  // Fallback: mock mode for testing.
   private async generateSubQuestions(question: string, response: string, m: number, targetModel: string, hasKeys: boolean): Promise<string[]> {
     const numQuestions = Math.max(1, m - 1);
+    const hasHfKey = !!(process.env.HF_API_KEY);
     
-    if (!hasKeys) {
-      // Mock mode
-      return Array.from({ length: numQuestions }).map((_, i) => 
-        `Mock verification sub-question ${i + 1} (Question: ${question.slice(0, 10)}...)`
-      );
-    }
+    if (hasKeys) {
+      // LLM-based sub-question generation
+      const systemPrompt = `You are a hallucination verification question generator. Given a Question and an Answer, generate exactly ${numQuestions} YES/NO verification questions that each check one specific factual claim from the Answer.
 
-    const systemPrompt = `You are a verification question generator. Given a Question and an Answer, generate exactly ${numQuestions} short, factual, and independent verification questions that check the specific facts asserted in the Answer. The questions should be clear, answerable in one sentence, and should not overlap. Output ONLY a valid JSON string array of questions. For example: ["Question 1?", "Question 2?"]`;
-    const prompt = `Question: "${question}"\nAnswer: "${response}"`;
-    
-    try {
-      const result = await this.callLLM(targetModel, prompt, 0.2, systemPrompt);
-      const cleanJson = result.replace(/```json|```/g, '').trim();
-      const parsed = JSON.parse(cleanJson);
-      if (Array.isArray(parsed)) {
-        return parsed.slice(0, numQuestions);
+Rules:
+1. CRITICAL: Generate questions in the SAME LANGUAGE as the Question and Answer.
+2. Each question MUST directly reference the specific facts stated in the Answer (exact dates, numbers, magnitudes, names, locations).
+3. Phrase as a closed YES/NO question. Example: "Is it true that the earthquake occurred on April 2, 2024?"
+4. Do NOT ask open-ended questions.
+5. Questions must be independent and non-overlapping.
+6. Output ONLY a valid JSON string array.`;
+      const prompt = `Question: "${question}"\nAnswer: "${response}"`;
+
+      try {
+        const result = await this.callLLM(targetModel, prompt, 0, systemPrompt);
+        const cleanJson = result.replace(/```json|```/g, '').trim();
+        const parsed = JSON.parse(cleanJson);
+        if (Array.isArray(parsed)) {
+          const valid = parsed
+            .filter((q: any) => typeof q === 'string' && q.trim().length >= 10 && /[가-힣a-zA-Z]{4,}/.test(q))
+            .slice(0, numQuestions);
+          if (valid.length > 0) return valid;
+        }
+      } catch (e) {
+        this.logger.error(`Error generating verification questions, falling back: ${e.message}`);
       }
-    } catch (e) {
-      this.logger.error(`Error generating verification questions, falling back to default sub-questions: ${e.message}`);
     }
 
+    if (hasHfKey) {
+      // Rule-based sub-question generation for HF-proxy mode.
+      // Decompose the response into multiple verification angles.
+      this.logger.log('[HF-proxy] Generating rule-based sub-questions from question/response.');
+
+      const candidates: string[] = [];
+
+      // 1. Paraphrase the original question
+      candidates.push(question);
+
+      // 2. Extract key entities and ask about them individually
+      // Split response into clauses to extract claims
+      const clauses = response
+        .split(/[,;，；]/)
+        .map(s => s.trim())
+        .filter(s => s.length > 5);
+      for (const clause of clauses) {
+        candidates.push(`Is it true that "${clause}"?`);
+      }
+
+      // 3. Negation check: assert the opposite
+      candidates.push(`Is the opposite of "${response.slice(0, 50)}" true?`);
+
+      // 4. Specificity check: ask about key details
+      candidates.push(`What specific facts can be confirmed about: ${question}`);
+
+      // 5. Consistency check: rephrase with different wording
+      candidates.push(`What is the accurate answer to: ${question}`);
+
+      // Return up to numQuestions unique candidates
+      return candidates.slice(0, numQuestions);
+    }
+    
+    // Mock mode fallback (no LLM, no HF key)
     return Array.from({ length: numQuestions }).map((_, i) => 
-      `Verification sub-question ${i + 1} about the answer details.`
+      `Mock verification sub-question ${i + 1} (Question: ${question.slice(0, 10)}...)`
     );
   }
 
-  // ── Helper Methods ──
+
 
   private hasApiKeys(): boolean {
     return !!(process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY);
+  }
+
+  /**
+   * Check if a local LLM server (e.g. Ollama, llama.cpp, vLLM) is configured.
+   * Set LOCAL_LLM_URL to an OpenAI-compatible endpoint, e.g.:
+   *   - Ollama:    http://127.0.0.1:11434/v1
+   *   - llama.cpp: http://127.0.0.1:8080/v1
+   *   - vLLM:      http://127.0.0.1:8000/v1
+   * Optionally set LOCAL_LLM_MODEL (default: auto-detected or 'qwen2.5:7b').
+   */
+  private hasLocalLlm(): boolean {
+    return !!(process.env.LOCAL_LLM_URL);
   }
 
   private calculateMpd(matrix: number[][]): number {
@@ -389,24 +608,46 @@ export class McpService {
     return 1 - mean;
   }
 
-  private async getEntailment(premise: string, hypothesis: string, useHf: boolean, hasKeys: boolean, nliModel: string): Promise<number> {
-    // 1. If HF evaluation is requested and HF_API_KEY is present, prioritize calling HF Inference API
-    if (useHf && process.env.HF_API_KEY) {
+  private async getEntailment(premise: string, hypothesis: string, useHf: boolean, hasKeys: boolean, nliModel: string, useLocalModel = false): Promise<number> {
+    // 1. Local NLI server — only when explicitly requested (Stage 2).
+    //    KLUE-RoBERTa is Korean-specialized; using it on Stage 1 (KO premise + EN hypothesis) causes false positives.
+    if (useLocalModel) {
       try {
-        return await this.callHuggingFaceNli(premise, hypothesis);
+        return await this.callLocalNli(premise, hypothesis);
       } catch (e) {
-        this.logger.warn(`HF Inference API call failed, falling back to other evaluation methods: ${e.message}`);
+        this.logger.warn(`Local NLI server unavailable: ${e.message}`);
       }
     }
 
-    const useSampling = this.canUseSampling();
-    if (!hasKeys && !useSampling) {
-      // Fall back to Jaccard similarity simulation if API keys and client sampling are both unavailable
-      return this.calculateJaccardSimilarity(premise, hypothesis);
+    // 2. HF Inference API fallback (requires credits)
+    if (useHf && process.env.HF_API_KEY) {
+      try {
+        const hfModelId = nliModel.includes('/') ? nliModel : undefined;
+        return await this.callHuggingFaceNli(premise, hypothesis, hfModelId);
+      } catch (e) {
+        this.logger.warn(`HF Inference API call failed: ${e.message}. Trying local NLI model fallback.`);
+        try {
+          return await this.callLocalNli(premise, hypothesis);
+        } catch (localErr) {
+          this.logger.warn(`Local NLI fallback also failed: ${localErr.message}`);
+        }
+      }
     }
 
-    // LLM-based entailment evaluation
-    return await this.callLlmNli(premise, hypothesis, nliModel);
+    // 3. LLM-based entailment evaluation
+    try {
+      return await this.callLlmNli(premise, hypothesis, nliModel);
+    } catch (e) {
+      this.logger.warn(`LLM NLI call failed: ${e.message}. Trying local NLI model fallback.`);
+      try {
+        return await this.callLocalNli(premise, hypothesis);
+      } catch (localErr) {
+        this.logger.warn(`Local NLI fallback failed: ${localErr.message}`);
+      }
+    }
+
+    // 4. Jaccard similarity fallback
+    return this.calculateJaccardSimilarity(premise, hypothesis);
   }
 
   private calculateJaccardSimilarity(a: string, b: string): number {
@@ -431,17 +672,108 @@ export class McpService {
   }
 
   private async callLLM(model: string, prompt: string, temperature: number, systemPrompt?: string): Promise<string> {
-    if (this.hasApiKeys()) {
-      if (model.startsWith('claude') && process.env.ANTHROPIC_API_KEY) {
-        return await this.callAnthropic(model, prompt, temperature, systemPrompt);
-      } else if (process.env.OPENAI_API_KEY) {
-        return await this.callOpenAI(model, prompt, temperature, systemPrompt);
+    // Priority: API Keys > Client Sampling > Local LLM (Ollama etc.) > HF API > Local Python LLM fallback
+    try {
+      if (this.hasApiKeys()) {
+        if (model.startsWith('claude') && process.env.ANTHROPIC_API_KEY) {
+          return await this.callAnthropic(model, prompt, temperature, systemPrompt);
+        } else if (process.env.OPENAI_API_KEY) {
+          return await this.callOpenAI(model, prompt, temperature, systemPrompt);
+        }
       }
-    } else if (this.canUseSampling()) {
-      this.logger.log(`Sending LLM request using client sampling capability (Model: ${model})`);
-      return await this.callClientSampling(model, prompt, temperature, systemPrompt);
+      if (this.canUseSampling()) {
+        this.logger.log(`Sending LLM request using client sampling capability (Model: ${model})`);
+        return await this.callClientSampling(model, prompt, temperature, systemPrompt);
+      }
+      if (this.hasLocalLlm()) {
+        // Local LLM server (Ollama, llama.cpp, vLLM, etc.)
+        const localModel = process.env.LOCAL_LLM_MODEL || 'qwen2.5:7b';
+        this.logger.log(`Sending LLM request to local server: ${process.env.LOCAL_LLM_URL} (Model: ${localModel})`);
+        return await this.callLocalLlm(localModel, prompt, temperature, systemPrompt);
+      }
+      if (process.env.HF_API_KEY) {
+        const hfModel = (model.startsWith('gpt') || model.startsWith('claude') || model === 'gpt-4o-mini')
+          ? (process.env.HF_LLM_MODEL_ID || 'Qwen/Qwen2.5-7B-Instruct')
+          : model;
+        this.logger.log(`Sending LLM request to Hugging Face Serverless Chat Completion API (Model: ${hfModel})`);
+        return await this.callHuggingFaceLLM(hfModel, prompt, temperature, systemPrompt);
+      }
+    } catch (err) {
+      this.logger.warn(`Standard LLM call failed: ${err.message}. Trying local Python LLM generation fallback.`);
+      try {
+        return await this.callLocalPythonGenerate(prompt, temperature, systemPrompt);
+      } catch (localErr) {
+        this.logger.error(`Local Python LLM fallback also failed: ${localErr.message}`);
+      }
+      throw err;
     }
-    throw new Error('No available API key or client sampling capability found.');
+    
+    // If we get here, no standard method ran because no keys/configurations are set. Try local python server fallback.
+    this.logger.log(`No keys configured. Querying local Python LLM generation fallback.`);
+    return await this.callLocalPythonGenerate(prompt, temperature, systemPrompt);
+  }
+
+  /**
+   * Call a local LLM server using OpenAI-compatible Chat Completion API.
+   * Works with Ollama, llama.cpp server, vLLM, LM Studio, etc.
+   */
+  private async callLocalLlm(model: string, prompt: string, temperature: number, systemPrompt?: string): Promise<string> {
+    const baseUrl = process.env.LOCAL_LLM_URL!.replace(/\/$/, '');
+    const url = `${baseUrl}/chat/completions`;
+    const body = {
+      model,
+      messages: [
+        ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
+        { role: 'user', content: prompt },
+      ],
+      temperature,
+      max_tokens: 512,
+    };
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(60000), // Local LLM can be slow
+    });
+
+    if (!response.ok) {
+      const err = await response.text();
+      throw new Error(`Local LLM API Error (status ${response.status}): ${err}`);
+    }
+
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content?.trim() || '';
+  }
+
+  private async callHuggingFaceLLM(model: string, prompt: string, temperature: number, systemPrompt?: string): Promise<string> {
+    const url = 'https://router.huggingface.co/v1/chat/completions';
+    const body = {
+      model,
+      messages: [
+        ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
+        { role: 'user', content: prompt }
+      ],
+      temperature,
+      max_tokens: 256,
+    };
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.HF_API_KEY || ''}`,
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      const err = await response.text();
+      throw new Error(`HF LLM API Error (status ${response.status}): ${err}`);
+    }
+
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content?.trim() || '';
   }
 
   private async callOpenAI(model: string, prompt: string, temperature: number, systemPrompt?: string): Promise<string> {
@@ -497,13 +829,104 @@ export class McpService {
     return data.content?.[0]?.text?.trim() || '';
   }
 
+  private get nliBaseUrl(): string {
+    return process.env.NLI_SERVER_URL || `http://127.0.0.1:${process.env.NLI_SERVER_PORT || '8001'}`;
+  }
+
+  private async callLocalParaphraser(question: string): Promise<string[]> {
+    const url = `${this.nliBaseUrl}/paraphrase`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!response.ok) throw new Error(`Local Paraphraser server error: ${response.status}`);
+    const data = await response.json();
+    return data.paraphrases as string[];
+  }
+
+  private async callLocalPythonGenerate(prompt: string, temperature: number, systemPrompt?: string): Promise<string> {
+    const url = `${this.nliBaseUrl}/generate`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt, system_prompt: systemPrompt, temperature }),
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!response.ok) throw new Error(`Local Python generate server error: ${response.status}`);
+    const data = await response.json();
+    return data.text as string;
+  }
+
+  private async callHuggingFaceSimilarityBulk(source: string, targets: string[], customModelId?: string): Promise<number[]> {
+    const modelId = customModelId || process.env.HF_MODEL_ID || 'jhgan/ko-sroberta-nli';
+    this.logger.log(`Calling Hugging Face Inference API for bulk similarity with model: ${modelId}`);
+
+    const url = `https://router.huggingface.co/hf-inference/models/${modelId}`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.HF_API_KEY || ''}`,
+      },
+      body: JSON.stringify({
+        inputs: {
+          source_sentence: source,
+          sentences: targets
+        }
+      }),
+    });
+
+    if (!response.ok) {
+      const err = await response.text();
+      throw new Error(`HF Bulk Similarity Error (status ${response.status}): ${err}`);
+    }
+
+    const data = await response.json();
+    if (Array.isArray(data)) {
+      return data.map((item: any) => {
+        if (typeof item === 'number') return item;
+        if (typeof item?.score === 'number') return item.score;
+        return 0;
+      });
+    }
+    throw new Error(`Unexpected bulk similarity response format: ${JSON.stringify(data)}`);
+  }
+
+  private async getBulkSimilarity(source: string, targets: string[], useHf: boolean, modelId: string): Promise<number[]> {
+    if (useHf && process.env.HF_API_KEY) {
+      try {
+        return await this.callHuggingFaceSimilarityBulk(source, targets, modelId);
+      } catch (err) {
+        this.logger.warn(`HF Bulk Similarity failed: ${err.message}. Falling back to Jaccard similarity.`);
+      }
+    }
+    return targets.map(t => this.calculateJaccardSimilarity(source, t));
+  }
+
+  private async callLocalNli(premise: string, hypothesis: string): Promise<number> {
+    const url = `${this.nliBaseUrl}/nli`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ premise, hypothesis }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!response.ok) throw new Error(`Local NLI server error: ${response.status}`);
+    const data = await response.json();
+    return data.entailment as number;
+  }
+
   private async callLlmNli(premise: string, hypothesis: string, nliModel: string): Promise<number> {
     const systemPrompt = `You are a Natural Language Inference (NLI) model. Determine the probability that the Premise entails the Hypothesis. Entailment means that if the Premise is true, the Hypothesis must also be true. Respond with a single floating-point number between 0.0 and 1.0 (where 1.0 means definite entailment and 0.0 means no entailment). Do not include any other text, reasoning, or formatting.`;
     const prompt = `Premise: "${premise}"\nHypothesis: "${hypothesis}"\nProbability of entailment:`;
 
     try {
       const result = await this.callLLM(nliModel, prompt, 0.0, systemPrompt);
-      const score = parseFloat(result);
+      // Extract first float in [0,1] range — handles responses like "The probability is 0.9."
+      const match = result.match(/\b(1(?:\.0+)?|0(?:\.\d+)?)\b/);
+      const score = match ? parseFloat(match[1]) : NaN;
       if (isNaN(score)) {
         this.logger.warn(`Failed to parse NLI result as a number: "${result}"`);
         return 0.5;
@@ -515,22 +938,37 @@ export class McpService {
     }
   }
 
-  private async callHuggingFaceNli(premise: string, hypothesis: string): Promise<number> {
-    const modelId = process.env.HF_MODEL_ID || 'microsoft/deberta-v2-xlarge-mnli';
+  private async callHuggingFaceNli(premise: string, hypothesis: string, customModelId?: string): Promise<number> {
+    const modelId = customModelId || process.env.HF_MODEL_ID || 'microsoft/deberta-v2-xlarge-mnli';
     this.logger.log(`Calling Hugging Face Inference API with model: ${modelId}`);
 
-    const response = await fetch(`https://api-inference.huggingface.co/models/${modelId}`, {
+    const isSentenceSimilarity = modelId.includes('jhgan/ko-sroberta-nli') || modelId.includes('sroberta') || modelId.includes('sentence');
+    const url = `https://router.huggingface.co/hf-inference/models/${modelId}`;
+
+    let bodyObj: any;
+    if (isSentenceSimilarity) {
+      bodyObj = {
+        inputs: {
+          source_sentence: premise,
+          sentences: [hypothesis]
+        }
+      };
+    } else {
+      bodyObj = {
+        inputs: {
+          text: premise,
+          text_pair: hypothesis,
+        }
+      };
+    }
+
+    const response = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${process.env.HF_API_KEY || ''}`,
       },
-      body: JSON.stringify({
-        inputs: {
-          text: premise,
-          text_pair: hypothesis,
-        },
-      }),
+      body: JSON.stringify(bodyObj),
     });
 
     if (!response.ok) {
@@ -539,20 +977,154 @@ export class McpService {
     }
 
     const data = await response.json();
-    if (Array.isArray(data) && Array.isArray(data[0])) {
-      const entailmentObj = data[0].find((item: any) => {
-        if (!item.label) return false;
-        const labelLower = item.label.toLowerCase();
-        return labelLower.includes('entail') || labelLower === 'label_0';
-      });
-      if (entailmentObj) {
-        return entailmentObj.score;
+    
+    if (isSentenceSimilarity) {
+      if (Array.isArray(data) && typeof data[0] === 'number') {
+        return data[0];
+      }
+      if (Array.isArray(data) && typeof data[0]?.score === 'number') {
+        return data[0].score;
+      }
+    } else {
+      if (Array.isArray(data) && Array.isArray(data[0])) {
+        const entailmentObj = data[0].find((item: any) => {
+          if (!item.label) return false;
+          const labelLower = item.label.toLowerCase();
+          return labelLower.includes('entail') || labelLower === 'label_0';
+        });
+        if (entailmentObj) {
+          return entailmentObj.score;
+        }
+      }
+      if (Array.isArray(data) && typeof data[0] === 'object') {
+        const entailmentObj = data.find((item: any) => {
+          if (!item.label) return false;
+          const labelLower = item.label.toLowerCase();
+          return labelLower.includes('entail') || labelLower === 'label_0';
+        });
+        if (entailmentObj) {
+          return entailmentObj.score;
+        }
       }
     }
-    throw new Error('Invalid Hugging Face response format');
+
+    throw new Error(`Invalid Hugging Face response format: ${JSON.stringify(data)}`);
   }
 
-  // ── Client-Side Sampling & JSON-RPC Helpers ──
+
+  // Uses a different model than Stage 1 (cross-encoder vs sentence similarity).
+  // Returns entailment probability (0~1). Uses HF zero-shot-classification/NLI pipeline.
+  private async callCrossEncoderNli(premise: string, hypothesis: string, modelId: string): Promise<number> {
+    this.logger.log(`[CrossEncoder] Calling ${modelId} for NLI`);
+
+    const isCustomModel = modelId.includes('serize') || modelId.includes('klue') || modelId.includes('stage2');
+    if (isCustomModel) {
+      this.logger.log(`[CrossEncoder] Detected custom classification model: ${modelId}. Querying standard classification API directly.`);
+      try {
+        return await this.callHuggingFaceNli(premise, hypothesis, modelId);
+      } catch (e) {
+        this.logger.warn(`[CrossEncoder] Custom model standard query failed: ${e.message}. Falling back to Stage 1 model.`);
+        return await this.callHuggingFaceNli(premise, hypothesis);
+      }
+    }
+
+    const url = `https://router.huggingface.co/hf-inference/models/${modelId}`;
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.HF_API_KEY || ''}`,
+        },
+        body: JSON.stringify({
+          inputs: premise,
+          parameters: {
+            candidate_labels: [hypothesis, 'contradiction'],
+          },
+        }),
+      });
+
+      if (!response.ok) {
+        const err = await response.text();
+        this.logger.warn(`[CrossEncoder] API error (${response.status}): ${err}. Trying standard text-classification on Stage 2 model.`);
+        return await this.callHuggingFaceNli(premise, hypothesis, modelId);
+      }
+
+      const data = await response.json();
+
+      if (Array.isArray(data)) {
+        const entailmentObj = data.find((item: any) =>
+          typeof item.label === 'string' &&
+          item.label.trim().toLowerCase() === hypothesis.trim().toLowerCase()
+        );
+        if (entailmentObj && typeof entailmentObj.score === 'number') {
+          return entailmentObj.score;
+        }
+      }
+
+      if (data && Array.isArray(data.labels) && Array.isArray(data.scores)) {
+        // Handle standard zero-shot response mapping (dict with labels & scores arrays)
+        const labelIndex = data.labels.findIndex((lbl: string) => 
+          lbl.trim().toLowerCase() === hypothesis.trim().toLowerCase()
+        );
+        if (labelIndex !== -1 && typeof data.scores[labelIndex] === 'number') {
+          return data.scores[labelIndex];
+        }
+      }
+
+      this.logger.warn(`[CrossEncoder] Unexpected zero-shot response format: ${JSON.stringify(data)}. Trying standard text-classification.`);
+      return await this.callHuggingFaceNli(premise, hypothesis, modelId);
+    } catch (err) {
+      this.logger.warn(`[CrossEncoder] Connection error: ${err.message}. Trying standard text-classification on Stage 2 model.`);
+      try {
+        return await this.callHuggingFaceNli(premise, hypothesis, modelId);
+      } catch (e2) {
+        this.logger.warn(`[CrossEncoder] Stage 2 standard classification query failed: ${e2.message}. Falling back to Stage 1 model.`);
+        return await this.callHuggingFaceNli(premise, hypothesis);
+      }
+    }
+  }
+
+  // Generate a negated/contradictory version of the response for contradiction detection.
+  // Used in Stage 2 to check if the NLI model can distinguish the original from its negation.
+  private generateNegation(text: string): string {
+    // Korean negation patterns (suffix-based)
+    const negations: [RegExp, string][] = [
+      [/입니다/g, '이(가) 아닙니다'],
+      [/했습니다/g, '하지 않았습니다'],
+      [/됩니다/g, '되지 않습니다'],
+      [/있습니다/g, '없습니다'],
+      [/됐습니다/g, '되지 않았습니다'],
+      [/이다/g, '이(가) 아니다'],
+      [/한다/g, '하지 않는다'],
+    ];
+
+    let negated = text;
+    let applied = false;
+    for (const [pattern, replacement] of negations) {
+      if (pattern.test(negated)) {
+        negated = negated.replace(pattern, replacement);
+        applied = true;
+        break; // Apply only the first matching negation to avoid double negation
+      }
+    }
+
+    // English fallback
+    if (!applied) {
+      // Simple English negation
+      if (negated.toLowerCase().includes(' is ')) {
+        negated = negated.replace(/ is /gi, ' is not ');
+      } else if (negated.toLowerCase().includes(' are ')) {
+        negated = negated.replace(/ are /gi, ' are not ');
+      } else {
+        negated = `It is not true that ${negated}`;
+      }
+    }
+
+    return negated;
+  }
+
+
 
   registerWriteCallback(callback: (msg: any) => void) {
     this.writeCallback = callback;

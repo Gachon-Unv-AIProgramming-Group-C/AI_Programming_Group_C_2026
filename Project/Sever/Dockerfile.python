@@ -1,0 +1,20 @@
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+
+WORKDIR /app
+
+COPY requirements-nli.txt .
+RUN pip install --no-cache-dir -r requirements-nli.txt
+
+COPY nli_server.py .
+COPY entrypoint.sh .
+RUN chmod +x entrypoint.sh
+
+ENV HF_STAGE2_MODEL_ID=serize/klue-roberta-base-nli-stage2
+ENV HF_PARA_MODEL_ID=serize/local-qwen-paraphraser
+ENV NLI_SERVER_PORT=8001
+
+EXPOSE 8001
+
+# Downloads the paraphraser model on first run if not already present,
+# then starts the Flask server.
+ENTRYPOINT ["./entrypoint.sh"]

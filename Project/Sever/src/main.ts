@@ -83,7 +83,7 @@ async function bootstrap() {
     app.enableCors();
 
     const port = process.env.PORT ?? 8000;
-    await app.listen(port);
+    await app.listen(port, '0.0.0.0');
     console.log(`Server running on: http://localhost:${port}`);
     console.log(`MCP endpoint: http://localhost:${port}/mcp`);
   }
