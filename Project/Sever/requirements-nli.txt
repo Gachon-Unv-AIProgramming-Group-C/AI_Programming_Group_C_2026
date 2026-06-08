@@ -3,3 +3,6 @@ transformers==5.9.0
 huggingface-hub>=0.20.0
 safetensors>=0.4.0
 tokenizers>=0.20.0
+bitsandbytes>=0.42.0
+accelerate>=0.26.0
+
