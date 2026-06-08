@@ -11,27 +11,34 @@ Layer 1 — LSC (Lowest Span Confidence)
   If logprobs are provided, low-confidence tokens trigger further checks.
 
 Layer 2 — SINdex (Semantic Inconsistency Index)
-  Samples multiple responses to the same question, clusters them,
-  and measures how scattered they are. High scatter = likely hallucination.
+  Samples multiple responses to the same question, clusters them, and
+  measures how scattered they are. High scatter = likely hallucination.
+  (Uses dynamic language-aware Jaccard thresholds: 0.90 for Korean, 0.65 for English/others)
 
 Layer 3 — SAC³ (Cross-model Consistency)
-  Paraphrases the original question using a fine-tuned Qwen model,
+  Paraphrases the original question using our fine-tuned Qwen paraphraser,
   asks an independent verifier, and checks if the answers agree.
   Our fine-tuned KLUE-RoBERTa NLI model scores the entailment.
 ```
 
 Verdict: `HALLUCINATION` | `NO_HALLUCINATION` | `UNCERTAIN` (manual review recommended)
 
-## Models
+## Models & Training Types
 
-Two custom models are used in this project:
+Our system combines open-source foundation models with custom-trained and fine-tuned models:
 
-| Model | Role | HuggingFace |
-|-------|------|-------------|
-| `serize/klue-roberta-base-nli-stage2` | NLI scoring (Layer 3 entailment) | [link](https://huggingface.co/serize/klue-roberta-base-nli-stage2) |
-| `serize/local-qwen-paraphraser` | Question paraphrasing (Layer 3) | [link](https://huggingface.co/serize/local-qwen-paraphraser) |
+### 1. Custom & Fine-Tuned Models (Directly Built/Trained)
+*   **`serize/klue-roberta-base-nli-stage2`** (NLI Classifier):
+    *   **Role**: Serves as the ultimate semantic consistency judge (Layer 3).
+    *   **Training**: Fully fine-tuned by us on the KLUE NLI dataset and uploaded to our Hugging Face repository.
+    *   **Link**: [Hugging Face Repository](https://huggingface.co/serize/klue-roberta-base-nli-stage2)
+*   **`serize/local-qwen-paraphraser`** (Question Paraphraser):
+    *   **Role**: Generates high-quality paraphrased questions to test LLM consistency (Layer 3).
+    *   **Training**: Fine-tuned by us using `Qwen2.5-0.5B-Instruct` as the base model and training it on the ParaKQC Korean paraphrase dataset.
+    *   **Link**: [Hugging Face Repository](https://huggingface.co/serize/local-qwen-paraphraser)
 
-The NLI model was fine-tuned on KLUE NLI data. The paraphraser is Qwen2.5-0.5B-Instruct fine-tuned on the ParaKQC Korean paraphrase dataset.
+### 2. External Base Models (Utilized)
+*   **`Qwen/Qwen2.5-3B-Instruct`**: Used as the default generator to sample multiple responses in Layer 2 (SINdex) when running queries.
 
 ## Project structure
 

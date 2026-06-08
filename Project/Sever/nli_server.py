@@ -3,7 +3,7 @@ import json
 import re
 import torch
 from flask import Flask, request, jsonify
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoModelForCausalLM, BitsAndBytesConfig
 
 app = Flask(__name__)
 
@@ -36,9 +36,41 @@ else:
 
 print(f"[nli_server] Loading Paraphrase model: {PARA_MODEL_ID}")
 para_tokenizer = AutoTokenizer.from_pretrained(PARA_MODEL_ID)
-para_model = AutoModelForCausalLM.from_pretrained(PARA_MODEL_ID).to(device)
+para_model = AutoModelForCausalLM.from_pretrained(PARA_MODEL_ID, torch_dtype=torch.float16).to(device)
 para_model.eval()
 print("[nli_server] Paraphrase model loaded.")
+
+# Load general generation model (Qwen2.5-3B-Instruct, 4-bit quantized for RTX 2060 6GB)
+GEN_MODEL_ID = os.environ.get('HF_GEN_MODEL_ID', 'Qwen/Qwen2.5-3B-Instruct')
+print(f"[nli_server] Loading general QA generation model: {GEN_MODEL_ID}")
+
+# Generation parameter defaults (can be overridden via env vars)
+GEN_TEMPERATURE = float(os.environ.get('GEN_TEMPERATURE', '0.3'))
+GEN_TOP_P = float(os.environ.get('GEN_TOP_P', '0.95'))
+GEN_MAX_NEW_TOKENS = int(os.environ.get('GEN_MAX_NEW_TOKENS', '128'))
+GEN_SYSTEM_PROMPT = os.environ.get(
+    'GEN_SYSTEM_PROMPT',
+    "You are a precise factual assistant. Answer only based on verified knowledge. "
+    "If you are not sure about a fact, say you don't know. "
+    "Answer concisely in Korean."
+)
+
+# 4-bit quantization config to fit 7B model within 6GB VRAM
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_quant_type='nf4',
+)
+
+gen_tokenizer = AutoTokenizer.from_pretrained(GEN_MODEL_ID)
+gen_model = AutoModelForCausalLM.from_pretrained(
+    GEN_MODEL_ID,
+    quantization_config=bnb_config,
+    device_map='auto',
+)
+gen_model.eval()
+print("[nli_server] General QA model (7B, 4-bit) loaded.")
 
 @app.route('/health')
 def health():
@@ -109,7 +141,7 @@ def paraphrase():
     with torch.no_grad():
         generated_ids = para_model.generate(
             **inputs,
-            max_new_tokens=256,
+            max_new_tokens=128,
             temperature=0.7,
             do_sample=True
         )
@@ -157,8 +189,13 @@ def paraphrase():
 def generate():
     data = request.get_json(force=True)
     prompt = data.get('prompt', '')
-    system_prompt = data.get('system_prompt', '')
-    temp = float(data.get('temperature', 0.7))
+    # Use provided or default system prompt
+    system_prompt = data.get('system_prompt', GEN_SYSTEM_PROMPT)
+
+    # Generation parameters with defaults from env vars
+    temperature = float(data.get('temperature', GEN_TEMPERATURE))
+    top_p = float(data.get('top_p', GEN_TOP_P))
+    max_new_tokens = int(data.get('max_new_tokens', GEN_MAX_NEW_TOKENS))
 
     if not prompt:
         return jsonify({'error': 'prompt is required'}), 400
@@ -169,19 +206,20 @@ def generate():
     messages.append({"role": "user", "content": prompt})
 
     try:
-        text = para_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = para_tokenizer([text], return_tensors="pt").to(device)
+        text = gen_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = gen_tokenizer([text], return_tensors="pt").to(device)
 
         with torch.no_grad():
-            generated_ids = para_model.generate(
+            generated_ids = gen_model.generate(
                 **inputs,
-                max_new_tokens=256,
-                temperature=temp if temp > 0 else 0.1,
-                do_sample=(temp > 0)
+                max_new_tokens=max_new_tokens,
+                temperature=temperature if temperature > 0 else 0.1,
+                top_p=top_p,
+                do_sample=(temperature > 0)
             )
 
         generated_ids = [output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, generated_ids)]
-        response = para_tokenizer.decode(generated_ids[0], skip_special_tokens=True).strip()
+        response = gen_tokenizer.decode(generated_ids[0], skip_special_tokens=True).strip()
         return jsonify({'text': response})
     except Exception as e:
         return jsonify({'error': str(e)}), 500

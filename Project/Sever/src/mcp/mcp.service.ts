@@ -214,8 +214,11 @@ export class McpService {
     const useSampling = this.canUseSampling();
     const hasHfKey = !!(process.env.HF_API_KEY);
     const hasLocalLlm = this.hasLocalLlm();
-    const canRunRealLlm = hasKeys || useSampling || hasHfKey || hasLocalLlm;
-    const mode = canRunRealLlm ? 'llm' : (useHf && hasHfKey ? 'hf-nli-proxy' : 'mock');
+    const hasLocalPython = this.hasLocalPythonServer();
+    const canRunRealLlm = hasKeys || useSampling || hasHfKey || hasLocalLlm || hasLocalPython;
+    const mode = canRunRealLlm 
+      ? (hasKeys || useSampling || hasLocalLlm ? 'llm' : 'local-python') 
+      : (useHf && hasHfKey ? 'hf-nli-proxy' : 'mock');
 
     const layersRun: number[] = [];
     let score1 = 0;
@@ -280,17 +283,29 @@ export class McpService {
 
     // Layer 2: SINdex
     layersRun.push(2);
+
+    // Language-aware strategy: detect Korean vs non-Korean input
+    // Korean: keep native language, Jaccard threshold 0.90 (Korean sentences are morphologically consistent)
+    // Non-Korean (English etc.): force English + one-sentence format, Jaccard threshold 0.65
+    const isKorean = /[\uAC00-\uD7AF\u1100-\u11FF\u3130-\u318F]/.test(input.question);
+    const clusterMergeThreshold = isKorean ? 0.90 : 0.65;
+
+    const sindexSystemPrompt = isKorean
+      ? `You are a factual question-answering assistant. Answer the question in ONE short, direct sentence in Korean only. Do not add explanations or extra sentences.`
+      : `You are a factual question-answering assistant. Answer the question in ONE short, direct sentence in English only. Do not add explanations, qualifications, or extra sentences. Example: "The capital of France is Paris."`;
+
     const targetSamples: string[] = [input.response];
 
     if (canRunRealLlm) {
       for (let i = 0; i < m; i++) {
         try {
-          const sample = await this.callLLM(targetModel, input.question, 0.7);
+          const sample = await this.callLLM(targetModel, input.question, 0.7, sindexSystemPrompt);
           targetSamples.push(sample);
         } catch (e) {
           this.logger.error(`Error generating sample ${i + 1}: ${e.message}`);
         }
       }
+
     } else if (mode === 'hf-nli-proxy') {
       targetSamples.push(input.response + " (alternative phrasing)");
       targetSamples.push(input.response + " (detailed statement)");
@@ -339,7 +354,7 @@ export class McpService {
         }
       }
 
-      if (maxSim >= 0.95) {
+      if (maxSim >= clusterMergeThreshold) {  // 0.90 for Korean, 0.65 for English
         clusters[mergeI] = [...clusters[mergeI], ...clusters[mergeJ]];
         clusters.splice(mergeJ, 1);
       } else {
@@ -347,22 +362,39 @@ export class McpService {
       }
     }
 
-    let sindexSum = 0;
+    // Calculate raw clustering entropy (dispersion) to measure model uncertainty
+    let entropySum = 0;
     for (const c of clusters) {
       const pC = c.length / K;
-      let sumSimToOriginal = 0;
-      for (const idx of c) {
-        sumSimToOriginal += similarityMatrix[idx][0];
-      }
-      const simC = sumSimToOriginal / c.length;
       if (pC > 0) {
-        sindexSum += pC * simC * Math.log(pC);
+        entropySum += pC * Math.log(pC);
       }
     }
-    const sindex = -sindexSum;
-    score2 = K > 1 ? sindex / Math.log(K) : 0;
-    score2 = Math.max(0, Math.min(1, score2));
+    const rawEntropy = -entropySum;
+    const dispersion = K > 1 ? rawEntropy / Math.log(K) : 0;
 
+    // Calculate NLI contradiction (disagreement between generated samples and original response)
+    // to catch confident-wrong hallucinations (where the model is consistent, but contradicts the original response).
+    const entailmentsToOriginal: number[] = [];
+    for (let i = 1; i < K; i++) {
+      try {
+        // premise: targetSamples[i] (generated sample)
+        // hypothesis: targetSamples[0] (original response)
+        const score = await this.getEntailment(targetSamples[i], targetSamples[0], useHf, hasKeys, nliModel);
+        entailmentsToOriginal.push(score);
+      } catch (e) {
+        this.logger.error(`Error calculating entailment for sample ${i}: ${e.message}`);
+        // Fallback to Jaccard similarity if NLI fails
+        entailmentsToOriginal.push(similarityMatrix[i][0]);
+      }
+    }
+
+    const avgEntailment = entailmentsToOriginal.length > 0
+      ? entailmentsToOriginal.reduce((sum, s) => sum + s, 0) / entailmentsToOriginal.length
+      : 1.0;
+    const nliInconsistency = 1 - avgEntailment;
+
+    // Map cluster details including their size and semantic similarity to the original response
     const clusterDetails = clusters.map((c, idx) => {
       const members = c.map(i => targetSamples[i]);
       const sumSimToOriginal = c.reduce((sum, i) => sum + similarityMatrix[i][0], 0);
@@ -375,8 +407,31 @@ export class McpService {
       };
     });
 
+    // Find the majority cluster among generated samples (indices >= 1), breaking ties in favor of the cluster containing the original response (index 0)
+    let majorityCluster = clusters.find(c => c.includes(0)) || clusters[0];
+    let maxGenSize = majorityCluster.filter(idx => idx >= 1).length;
+
+    for (const c of clusters) {
+      const genSize = c.filter(idx => idx >= 1).length;
+      if (genSize > maxGenSize) {
+        maxGenSize = genSize;
+        majorityCluster = c;
+      }
+    }
+
+    const sumSimToOriginal = majorityCluster.reduce((sum, idx) => sum + similarityMatrix[idx][0], 0);
+    const majoritySimToOriginal = majorityCluster.length > 0 ? sumSimToOriginal / majorityCluster.length : 1.0;
+    const majorityDisagreement = 1 - majoritySimToOriginal;
+
+    // Combine dispersion (10%), NLI inconsistency (30%), and majority disagreement (60%)
+    score2 = 0.1 * dispersion + 0.3 * nliInconsistency + 0.6 * majorityDisagreement;
+    score2 = Math.max(0, Math.min(1, score2));
+
     details.clusters = clusterDetails;
     details.score2 = score2;
+    details.dispersion = dispersion;
+    details.nliInconsistency = nliInconsistency;
+    details.majorityDisagreement = majorityDisagreement;
     details.targetSamples = targetSamples;
 
     if (score2 < s2_threshold && !forceLayers2And3) {
@@ -430,13 +485,13 @@ export class McpService {
       for (const pq of paraphrasedQuestions) {
         for (let i = 0; i < nSac; i++) {
           try {
-            const tAns = await this.callLLM(targetModel, pq, 0.7);
+            const tAns = await this.callLLM(targetModel, pq, 0.7, sindexSystemPrompt);
             sacTargetAnswers.push(tAns);
           } catch (e) {
             this.logger.error(`Error sampling target answer for "${pq}": ${e.message}`);
           }
           try {
-            const vAns = await this.callLLM(verifierModel, pq, 0.7);
+            const vAns = await this.callLLM(verifierModel, pq, 0.7, sindexSystemPrompt);
             sacVerifierAnswers.push(vAns);
           } catch (e) {
             this.logger.error(`Error sampling verifier answer for "${pq}": ${e.message}`);
@@ -595,6 +650,10 @@ Rules:
     return !!(process.env.LOCAL_LLM_URL);
   }
 
+  private hasLocalPythonServer(): boolean {
+    return true;
+  }
+
   private calculateMpd(matrix: number[][]): number {
     let sum = 0;
     let count = 0;
@@ -609,6 +668,15 @@ Rules:
   }
 
   private async getEntailment(premise: string, hypothesis: string, useHf: boolean, hasKeys: boolean, nliModel: string, useLocalModel = false): Promise<number> {
+    // Prioritize local Python NLI server if configured to avoid external API calls/quota issues
+    if (this.hasLocalPythonServer()) {
+      try {
+        return await this.callLocalNli(premise, hypothesis);
+      } catch (e) {
+        this.logger.warn(`Local NLI server call failed: ${e.message}. Trying other methods.`);
+      }
+    }
+
     // 1. Local NLI server — only when explicitly requested (Stage 2).
     //    KLUE-RoBERTa is Korean-specialized; using it on Stage 1 (KO premise + EN hypothesis) causes false positives.
     if (useLocalModel) {
@@ -672,18 +740,22 @@ Rules:
   }
 
   private async callLLM(model: string, prompt: string, temperature: number, systemPrompt?: string): Promise<string> {
-    // Priority: API Keys > Client Sampling > Local LLM (Ollama etc.) > HF API > Local Python LLM fallback
+    // Priority: Client Sampling (자체 에이전트) > Local Python Server (Qwen) > API Keys (OpenAI/Anthropic) > Local LLM (Ollama) > HF API
     try {
+      if (this.canUseSampling()) {
+        this.logger.log(`Sending LLM request using client sampling capability (Model: ${model})`);
+        return await this.callClientSampling(model, prompt, temperature, systemPrompt);
+      }
+      if (this.hasLocalPythonServer()) {
+        this.logger.log(`Using local Python server (Qwen) for LLM generation.`);
+        return await this.callLocalPythonGenerate(prompt, temperature, systemPrompt);
+      }
       if (this.hasApiKeys()) {
         if (model.startsWith('claude') && process.env.ANTHROPIC_API_KEY) {
           return await this.callAnthropic(model, prompt, temperature, systemPrompt);
         } else if (process.env.OPENAI_API_KEY) {
           return await this.callOpenAI(model, prompt, temperature, systemPrompt);
         }
-      }
-      if (this.canUseSampling()) {
-        this.logger.log(`Sending LLM request using client sampling capability (Model: ${model})`);
-        return await this.callClientSampling(model, prompt, temperature, systemPrompt);
       }
       if (this.hasLocalLlm()) {
         // Local LLM server (Ollama, llama.cpp, vLLM, etc.)
@@ -895,6 +967,11 @@ Rules:
   }
 
   private async getBulkSimilarity(source: string, targets: string[], useHf: boolean, modelId: string): Promise<number[]> {
+    // If using local Python server, avoid calling external Hugging Face similarity APIs to prevent credit depletion/timeouts.
+    if (this.hasLocalPythonServer()) {
+      return targets.map(t => this.calculateJaccardSimilarity(source, t));
+    }
+
     if (useHf && process.env.HF_API_KEY) {
       try {
         return await this.callHuggingFaceSimilarityBulk(source, targets, modelId);

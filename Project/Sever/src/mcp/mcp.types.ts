@@ -79,6 +79,9 @@ export interface HallucinationCheckResult {
     selfMpd?: number;
     crossMpd?: number;
     combinedMpd?: number;
+    dispersion?: number;
+    nliInconsistency?: number;
+    majorityDisagreement?: number;
     targetSamples?: string[];
     verifierSamples?: string[];
     clusters?: { label: string; size: number; members: string[]; similarityToOriginal: number }[];
