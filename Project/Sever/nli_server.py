@@ -36,7 +36,11 @@ else:
 
 print(f"[nli_server] Loading Paraphrase model: {PARA_MODEL_ID}")
 para_tokenizer = AutoTokenizer.from_pretrained(PARA_MODEL_ID)
-para_model = AutoModelForCausalLM.from_pretrained(PARA_MODEL_ID, torch_dtype=torch.float16).to(device)
+if device == "cuda":
+    para_model = AutoModelForCausalLM.from_pretrained(PARA_MODEL_ID, torch_dtype=torch.float16).to(device)
+else:
+    # Use bfloat16 on CPU as it is better supported and faster than float16
+    para_model = AutoModelForCausalLM.from_pretrained(PARA_MODEL_ID, torch_dtype=torch.bfloat16).to(device)
 para_model.eval()
 print("[nli_server] Paraphrase model loaded.")
 
@@ -55,20 +59,40 @@ GEN_SYSTEM_PROMPT = os.environ.get(
     "Answer concisely in Korean."
 )
 
-# 4-bit quantization config to fit 7B model within 6GB VRAM
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_compute_dtype=torch.float16,
-    bnb_4bit_use_double_quant=True,
-    bnb_4bit_quant_type='nf4',
-)
-
 gen_tokenizer = AutoTokenizer.from_pretrained(GEN_MODEL_ID)
-gen_model = AutoModelForCausalLM.from_pretrained(
-    GEN_MODEL_ID,
-    quantization_config=bnb_config,
-    device_map='auto',
-)
+
+if device == "cuda":
+    # 4-bit quantization config to fit 7B model within 6GB VRAM (only for NVIDIA GPU)
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type='nf4',
+    )
+    gen_model = AutoModelForCausalLM.from_pretrained(
+        GEN_MODEL_ID,
+        quantization_config=bnb_config,
+        device_map='auto',
+    )
+    print("[nli_server] General QA model loaded on GPU (4-bit quantized).")
+else:
+    # On CPU/Intel GPU (no CUDA), bitsandbytes is not supported and will hang.
+    # Load model in bfloat16 or float32 directly without quantization.
+    print("[nli_server] Disabling 4-bit quantization on CPU/Intel GPU (no CUDA support).")
+    try:
+        gen_model = AutoModelForCausalLM.from_pretrained(
+            GEN_MODEL_ID,
+            torch_dtype=torch.bfloat16,
+            device_map='auto',
+        )
+    except Exception as e:
+        print(f"[nli_server] Failed to load with bfloat16: {e}. Falling back to default dtype.")
+        gen_model = AutoModelForCausalLM.from_pretrained(
+            GEN_MODEL_ID,
+            device_map='auto',
+        )
+    print("[nli_server] General QA model loaded on CPU/non-CUDA.")
+
 gen_model.eval()
 print("[nli_server] General QA model (7B, 4-bit) loaded.")
 
