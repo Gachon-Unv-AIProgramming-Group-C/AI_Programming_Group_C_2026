@@ -290,9 +290,17 @@ export class McpService {
     const isKorean = /[\uAC00-\uD7AF\u1100-\u11FF\u3130-\u318F]/.test(input.question);
     const clusterMergeThreshold = isKorean ? 0.90 : 0.65;
 
+    // Dynamically adapt prompt length based on the original response's format (short vs full sentence)
+    const cleanResponse = input.response.trim();
+    const isShortResponse = cleanResponse.split(/\s+/).length <= 2 || cleanResponse.length < 10;
+
     const sindexSystemPrompt = isKorean
-      ? `You are a factual question-answering assistant. Answer the question in ONE short, direct sentence in Korean only. Do not add explanations or extra sentences.`
-      : `You are a factual question-answering assistant. Answer the question in ONE short, direct sentence in English only. Do not add explanations, qualifications, or extra sentences. Example: "The capital of France is Paris."`;
+      ? (isShortResponse
+          ? `You are a factual question-answering assistant. Answer the question in a single word or a short phrase only. Do not write a full sentence. Example: "서울" or "대한민국".`
+          : `You are a factual question-answering assistant. Answer the question in ONE short, direct sentence in Korean only. Do not add explanations or extra sentences.`)
+      : (isShortResponse
+          ? `You are a factual question-answering assistant. Answer the question in a single word or a short phrase only. Do not write a full sentence. Example: "Paris" or "France".`
+          : `You are a factual question-answering assistant. Answer the question in ONE short, direct sentence in English only. Do not add explanations, qualifications, or extra sentences. Example: "The capital of France is Paris."`);
 
     const targetSamples: string[] = [input.response];
 
@@ -668,6 +676,11 @@ Rules:
   }
 
   private async getEntailment(premise: string, hypothesis: string, useHf: boolean, hasKeys: boolean, nliModel: string, useLocalModel = false): Promise<number> {
+    // If one contains a negation and the other does not, they are logically contradictory, so entailment must be 0.0.
+    if (this.hasNegation(premise) !== this.hasNegation(hypothesis)) {
+      return 0.0;
+    }
+
     // Prioritize local Python NLI server if configured to avoid external API calls/quota issues
     if (this.hasLocalPythonServer()) {
       try {
@@ -718,12 +731,55 @@ Rules:
     return this.calculateJaccardSimilarity(premise, hypothesis);
   }
 
+  private stemKoreanToken(token: string): string {
+    if (!/[\uAC00-\uD7AF]/.test(token)) return token;
+
+    let stemmed = token;
+    const suffixes = [
+      '였습니까', '였습니다', '입니까', '입니다', '였으며', '이었고', '이고', '이며',
+      '에서', '으로', '부터', '까지', '보다', '처럼', '만큼',
+      '은', '는', '이', '가', '을', '를', '의', '에', '로', '와', '과', '도', '만', '랑', '나'
+    ];
+
+    for (const suffix of suffixes) {
+      if (stemmed.endsWith(suffix) && stemmed.length > suffix.length) {
+        stemmed = stemmed.slice(0, -suffix.length);
+        break;
+      }
+    }
+    return stemmed;
+  }
+
+  private hasNegation(text: string): boolean {
+    const clean = text.toLowerCase().replace(/[^\w\sㄱ-ㅎㅏ-ㅣ가-힣]/g, '');
+    const tokens = clean.split(/\s+/);
+    
+    // Comprehensive Korean negation words and suffixes
+    const krNegations = [
+      '아닙니다', '아니', '않습니다', '않다', '안', '못', '아님', '아니다', 
+      '않음', '않은', '아닌', '말고', '말라', '말아', '없다', '없습니다', '없음', '없는'
+    ];
+    // Comprehensive English negation words and contractions (stripped of apostrophes)
+    const enNegations = [
+      'not', 'never', 'no', 'cannot', 'cant', 'isnt', 'arent', 'didnt', 
+      'wasnt', 'werent', 'havent', 'hasnt', 'hadnt', 'dont', 'doesnt',
+      'wont', 'shouldnt', 'couldnt', 'wouldnt', 'mustnt', 'shant', 'mightnt',
+      'none', 'nothing', 'neither', 'nor', 'nobody', 'nowhere', 'lack', 'without'
+    ];
+
+    return tokens.some(t => {
+      if (enNegations.includes(t) || krNegations.includes(t)) return true;
+      return krNegations.some(neg => t.includes(neg));
+    });
+  }
+
   private calculateJaccardSimilarity(a: string, b: string): number {
     const cleanTokens = (text: string) =>
       text.toLowerCase()
         .replace(/[^\w\sㄱ-ㅎㅏ-ㅣ가-힣]/g, '')
         .split(/\s+/)
-        .filter(t => t.length > 0);
+        .filter(t => t.length > 0)
+        .map(t => this.stemKoreanToken(t));
 
     const tokensA = cleanTokens(a);
     const tokensB = cleanTokens(b);
@@ -736,7 +792,14 @@ Rules:
     const intersection = new Set([...setA].filter(x => setB.has(x)));
     const union = new Set([...setA, ...setB]);
     
-    return intersection.size / union.size;
+    let sim = intersection.size / union.size;
+
+    // Apply severe penalty if one statement is negated and the other is not (logical contradiction)
+    if (this.hasNegation(a) !== this.hasNegation(b)) {
+      sim = sim * 0.1;
+    }
+
+    return sim;
   }
 
   private async callLLM(model: string, prompt: string, temperature: number, systemPrompt?: string): Promise<string> {
