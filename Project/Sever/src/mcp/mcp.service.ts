@@ -8,11 +8,13 @@ import {
   HallucinationCheckResult,
 } from './mcp.types';
 
+// McpService는 MCP 프로토콜 처리와 할루시네이션 탐지 핵심 알고리즘을 담당한다
 @Injectable()
 export class McpService {
   private readonly logger = new Logger(McpService.name);
-  private clientCapabilities: any = null;
-  private writeCallback?: (msg: any) => void;
+  private clientCapabilities: any = null;  // Claude가 보내는 클라이언트 기능 목록을 저장
+  private writeCallback?: (msg: any) => void;  // stdio 모드에서 응답을 쓰는 콜백
+  // Claude의 sampling 요청(LLM 호출)에 대한 응답을 비동기로 받기 위한 Promise 맵
   private readonly pendingRequests = new Map<
     string | number,
     { resolve: (value: any) => void; reject: (reason?: any) => void }
@@ -235,14 +237,17 @@ export class McpService {
 
     this.logger.debug(`check_hallucination mode=${mode} q="${input.question.slice(0, 60)}"`);
 
-    // Layer 1: LSC
+    // ─── Layer 1: LSC (Lowest Span Confidence) ───────────────────────────────
+    // 토큰별 로그확률(logprobs)이 제공된 경우에만 실행된다
+    // Claude API는 logprobs를 미제공하므로, OpenAI API 사용 시에만 동작한다
     layersRun.push(1);
     if (input.logprobs && input.logprobs.length > 0) {
       let minSpanConfidence = 1.0;
       const tokens = input.logprobs;
-      const windowSizes = [2, 3, 5];
+      const windowSizes = [2, 3, 5];  // 슬라이딩 윈도우 크기 목록
       let hasValidWindow = false;
 
+      // 슬라이딩 윈도우로 각 구간의 기하평균 확률을 계산하여 최솟값을 찾는다
       for (const w of windowSizes) {
         if (tokens.length >= w) {
           for (let i = 0; i <= tokens.length - w; i++) {
@@ -250,7 +255,7 @@ export class McpService {
             for (let j = 0; j < w; j++) {
               sumLogProb += tokens[i + j].logprob;
             }
-            const spanProb = Math.exp(sumLogProb / w); // geometric mean probability
+            const spanProb = Math.exp(sumLogProb / w); // 로그확률 합의 지수 = 기하평균 확률
             if (spanProb < minSpanConfidence) {
               minSpanConfidence = spanProb;
             }
@@ -259,10 +264,12 @@ export class McpService {
         }
       }
 
+      // score1 = 1 - LSC: 값이 클수록 모델이 불확실했음을 의미 (할루시네이션 위험)
       const lsc = hasValidWindow ? minSpanConfidence : 0.5;
       score1 = 1 - lsc;
       details.score1 = score1;
 
+      // score1이 t1 미만이면 신뢰도가 충분하므로 Layer 2, 3 없이 조기 종료
       if (score1 < t1) {
         const final_score = w1 * score1;
         return {
@@ -273,20 +280,23 @@ export class McpService {
           details: { ...details, final_score, stage: 1, selfMpd: score1, combinedMpd: score1 }
         };
       }
+      // score1이 tStar 이상이면 매우 위험하다고 판단하여 Layer 2, 3을 강제 실행
       if (score1 >= tStar) {
         forceLayers2And3 = true;
       }
     } else {
+      // logprobs가 없으면 Layer 1을 건너뛰고 중간값(0.45)으로 설정한다
       score1 = 0.45;
       details.score1 = score1;
     }
 
-    // Layer 2: SINdex
+    // ─── Layer 2: SINdex (Semantic Inconsistency Index) ─────────────────────
+    // 동일 질문을 LLM에 m회 독립 샘플링하여 응답들의 의미적 분산을 측정한다
+    // 분산이 클수록 모델이 불확실하다는 의미이므로 할루시네이션 위험도가 높다
     layersRun.push(2);
 
-    // Language-aware strategy: detect Korean vs non-Korean input
-    // Korean: keep native language, Jaccard threshold 0.90 (Korean sentences are morphologically consistent)
-    // Non-Korean (English etc.): force English + one-sentence format, Jaccard threshold 0.65
+    // 한국어/영어를 감지하여 LLM 프롬프트 언어와 군집화 임계값을 다르게 적용한다
+    // 한국어는 형태소 변형이 많아 표면형이 달라도 의미가 같은 경우가 많으므로 더 높은 임계값 사용
     const isKorean = /[\uAC00-\uD7AF\u1100-\u11FF\u3130-\u318F]/.test(input.question);
     const clusterMergeThreshold = isKorean ? 0.90 : 0.65;
 
@@ -302,9 +312,11 @@ export class McpService {
           ? `You are a factual question-answering assistant. Answer the question in a single word or a short phrase only. Do not write a full sentence. Example: "Paris" or "France".`
           : `You are a factual question-answering assistant. Answer the question in ONE short, direct sentence in English only. Do not add explanations, qualifications, or extra sentences. Example: "The capital of France is Paris."`);
 
+    // 검증 대상 응답(index 0)을 포함하여 LLM에서 m개의 샘플을 추가로 생성한다
     const targetSamples: string[] = [input.response];
 
     if (canRunRealLlm) {
+      // LLM을 temperature=0.7로 m회 호출하여 다양한 응답 샘플을 수집한다
       for (let i = 0; i < m; i++) {
         try {
           const sample = await this.callLLM(targetModel, input.question, 0.7, sindexSystemPrompt);
@@ -324,6 +336,8 @@ export class McpService {
       }
     }
 
+    // 모든 샘플 쌍의 의미적 유사도를 KxK 행렬로 계산한다
+    // NLI entailment 점수 또는 Jaccard 유사도를 사용한다
     const K = targetSamples.length;
     const similarityMatrix: number[][] = [];
     for (let i = 0; i < K; i++) {
@@ -332,17 +346,20 @@ export class McpService {
         similarityMatrix.push(sims);
       } catch (e) {
         this.logger.error(`Error calculating bulk similarity for sample ${i}: ${e.message}`);
-        // Fallback similarity array
+        // NLI 실패 시 Jaccard 유사도로 대체한다
         similarityMatrix.push(targetSamples.map(t => this.calculateJaccardSimilarity(targetSamples[i], t)));
       }
     }
 
+    // Agglomerative Clustering (Average Linkage): 유사도가 임계값 이상인 샘플들을 같은 클러스터로 병합한다
+    // 클러스터 수가 많을수록 응답이 분산되어 있다는 의미 → 높은 불확실성
     let clusters: number[][] = Array.from({ length: K }).map((_, i) => [i]);
     while (clusters.length > 1) {
       let maxSim = -1;
       let mergeI = -1;
       let mergeJ = -1;
 
+      // 모든 클러스터 쌍 중 평균 유사도가 가장 높은 쌍을 찾는다
       for (let i = 0; i < clusters.length; i++) {
         for (let j = i + 1; j < clusters.length; j++) {
           let sumSim = 0;
@@ -353,7 +370,7 @@ export class McpService {
               sumSim += similarityMatrix[idxA][idxB];
             }
           }
-          const avgSim = sumSim / (cA.length * cB.length);
+          const avgSim = sumSim / (cA.length * cB.length);  // Average Linkage
           if (avgSim > maxSim) {
             maxSim = avgSim;
             mergeI = i;
@@ -362,7 +379,8 @@ export class McpService {
         }
       }
 
-      if (maxSim >= clusterMergeThreshold) {  // 0.90 for Korean, 0.65 for English
+      // 최대 유사도가 임계값 이상이면 두 클러스터를 병합한다. 이하면 더 이상 병합하지 않는다
+      if (maxSim >= clusterMergeThreshold) {  // 한국어: 0.90, 영어: 0.65
         clusters[mergeI] = [...clusters[mergeI], ...clusters[mergeJ]];
         clusters.splice(mergeJ, 1);
       } else {
@@ -370,29 +388,31 @@ export class McpService {
       }
     }
 
-    // Calculate raw clustering entropy (dispersion) to measure model uncertainty
+    // 클러스터 분포의 Shannon 엔트로피를 계산하고 log(K)로 정규화한다
+    // 클러스터가 1개이면 0, 모두 다른 클러스터이면 1에 가까워진다
     let entropySum = 0;
     for (const c of clusters) {
-      const pC = c.length / K;
+      const pC = c.length / K;  // 각 클러스터의 비율
       if (pC > 0) {
         entropySum += pC * Math.log(pC);
       }
     }
     const rawEntropy = -entropySum;
-    const dispersion = K > 1 ? rawEntropy / Math.log(K) : 0;
+    const dispersion = K > 1 ? rawEntropy / Math.log(K) : 0;  // 0~1로 정규화
 
-    // Calculate NLI contradiction (disagreement between generated samples and original response)
-    // to catch confident-wrong hallucinations (where the model is consistent, but contradicts the original response).
+    // NLI 기반 불일치율: 각 샘플이 원본 응답을 함의하는 정도의 평균을 구해 역수를 취한다
+    // 샘플들이 원본을 모순할수록 nliInconsistency가 1에 가까워진다
+    // 이 지표는 "모두 틀리게 일관된" 할루시네이션을 탐지하기 위한 핵심 척도이다
     const entailmentsToOriginal: number[] = [];
     for (let i = 1; i < K; i++) {
       try {
-        // premise: targetSamples[i] (generated sample)
-        // hypothesis: targetSamples[0] (original response)
+        // premise(전제): 생성된 샘플, hypothesis(가설): 원본 응답
+        // 샘플이 원본을 함의하면 entailment 점수가 높다
         const score = await this.getEntailment(targetSamples[i], targetSamples[0], useHf, hasKeys, nliModel);
         entailmentsToOriginal.push(score);
       } catch (e) {
         this.logger.error(`Error calculating entailment for sample ${i}: ${e.message}`);
-        // Fallback to Jaccard similarity if NLI fails
+        // NLI 실패 시 Jaccard 유사도로 대체한다
         entailmentsToOriginal.push(similarityMatrix[i][0]);
       }
     }
@@ -400,9 +420,9 @@ export class McpService {
     const avgEntailment = entailmentsToOriginal.length > 0
       ? entailmentsToOriginal.reduce((sum, s) => sum + s, 0) / entailmentsToOriginal.length
       : 1.0;
-    const nliInconsistency = 1 - avgEntailment;
+    const nliInconsistency = 1 - avgEntailment;  // 평균 entailment의 반대값
 
-    // Map cluster details including their size and semantic similarity to the original response
+    // 각 클러스터의 크기와 원본 응답과의 유사도를 계산한다 (디버깅용)
     const clusterDetails = clusters.map((c, idx) => {
       const members = c.map(i => targetSamples[i]);
       const sumSimToOriginal = c.reduce((sum, i) => sum + similarityMatrix[i][0], 0);
@@ -415,7 +435,8 @@ export class McpService {
       };
     });
 
-    // Find the majority cluster among generated samples (indices >= 1), breaking ties in favor of the cluster containing the original response (index 0)
+    // 생성된 샘플(index >= 1) 중 가장 많은 수를 포함하는 다수 클러스터를 찾는다
+    // 다수 클러스터가 원본과 다를수록 majorityDisagreement가 높아진다
     let majorityCluster = clusters.find(c => c.includes(0)) || clusters[0];
     let maxGenSize = majorityCluster.filter(idx => idx >= 1).length;
 
@@ -429,11 +450,11 @@ export class McpService {
 
     const sumSimToOriginal = majorityCluster.reduce((sum, idx) => sum + similarityMatrix[idx][0], 0);
     const majoritySimToOriginal = majorityCluster.length > 0 ? sumSimToOriginal / majorityCluster.length : 1.0;
-    const majorityDisagreement = 1 - majoritySimToOriginal;
+    const majorityDisagreement = 1 - majoritySimToOriginal;  // 다수 클러스터와 원본의 불일치 정도
 
-    // Combine dispersion (10%), NLI inconsistency (30%), and majority disagreement (60%)
+    // SINdex 최종 점수: 분산(10%) + NLI 불일치(30%) + 다수 불일치(60%) 가중합산
     score2 = 0.1 * dispersion + 0.3 * nliInconsistency + 0.6 * majorityDisagreement;
-    score2 = Math.max(0, Math.min(1, score2));
+    score2 = Math.max(0, Math.min(1, score2));  // 0~1 범위로 클리핑
 
     details.clusters = clusterDetails;
     details.score2 = score2;
@@ -453,7 +474,9 @@ export class McpService {
       };
     }
 
-    // Layer 3: SAC³
+    // ─── Layer 3: SAC³ (Self-Adaptive Cross-model Consistency) ─────────────
+    // 원본 질문을 패러프레이즈하여 다른 표현으로 LLM에 재질의한다
+    // 응답들이 원본 응답과 의미적으로 불일치하면 할루시네이션으로 판정한다
     layersRun.push(3);
     let paraphrasedQuestions: string[] = [];
 
